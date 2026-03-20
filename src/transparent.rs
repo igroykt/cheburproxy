@@ -5,7 +5,6 @@ use std::sync::Once;
 use nix::libc;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpStream;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 // Standard socket options for Linux (defined as constants for better maintainability)
 pub const IP_TRANSPARENT: i32 = 19;    // Standard value for IP_TRANSPARENT (defined once)

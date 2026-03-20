@@ -15,7 +15,6 @@ use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, Resol
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use tokio::sync::RwLock;
 use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -481,7 +480,7 @@ async fn forward_streams(client: TcpStream, target: TcpStream) -> ProxyResult<()
     }
 }
 
-async fn handle_tcp_connection(mut stream: TcpStream, config: Arc<ServerConfig>) -> ProxyResult<()> {
+async fn handle_tcp_connection(stream: TcpStream, config: Arc<ServerConfig>) -> ProxyResult<()> {
     let client_addr = stream.peer_addr()?;
     debug!("New TCP connection from: {}", client_addr);
 
