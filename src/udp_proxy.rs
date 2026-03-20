@@ -24,7 +24,7 @@ use crate::rule::{RuleEngine, RoutingDecision};
 use crate::find_domain_by_ip;
 use crate::proxy_health;
 use crate::proxy::{self, ProxyError};
-use crate::transparent::connect_tcp_with_mark;
+use crate::transparent::{connect_tcp_with_mark, set_socket_mark};
 use crate::udp_tunnel_frame;
 
 // Constants for better maintainability and performance
@@ -634,6 +634,9 @@ impl UdpSession {
         let _ = upstream_proxy_timeout;
         let outbound_socket = Arc::new(UdpSocket::bind("[::]:0").await?);
         // Set SO_MARK on direct UDP socket
+        if let Err(e) = set_socket_mark(outbound_socket.as_raw_fd(), 2) {
+            warn!("Failed to set SO_MARK on direct UDP socket: {}", e);
+        }
 
         outbound_socket.connect(target).await?;
 
@@ -1811,6 +1814,12 @@ pub async fn create_socks5_udp_associate(
 
     // Create and connect UDP socket for SOCKS5 communication
     let udp_socket = Arc::new(UdpSocket::bind("[::]:0").await?);
+    
+    // Set SO_MARK to avoid TPROXY loops for SOCKS5 UDP relay traffic (mark = 2)
+    if let Err(e) = set_socket_mark(udp_socket.as_raw_fd(), 2) {
+        warn!("Failed to set SO_MARK on SOCKS5 UDP socket: {}", e);
+    }
+    
     udp_socket.connect(send_to).await?;
 
     debug!("SOCKS5 UDP associate established with relay address: {}", send_to);
