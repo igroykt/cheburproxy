@@ -103,12 +103,12 @@ iptables -t mangle -A TPROXY_CHAIN -d 240.0.0.0/4   -j RETURN
 iptables -t mangle -A TPROXY_CHAIN -m mark --mark 0x1       -j RETURN
 iptables -t mangle -A TPROXY_CHAIN -m mark --mark 0x2       -j RETURN  # Skip proxy-originated outbound traffic
 iptables -t mangle -A TPROXY_CHAIN -p tcp -m socket --transparent -j MARK --set-mark 0x1
-iptables -t mangle -A TPROXY_CHAIN -p udp -m socket --transparent -j MARK --set-mark 0x1
+iptables -t mangle -A TPROXY_CHAIN -p udp -m socket --transparent -j MARK --set-mark 0x2
 iptables -t mangle -A TPROXY_CHAIN -m socket                -j RETURN
 
 # 4. Сам TPROXY — только выбранные порты (HTTP/HTTPS + мессенджеры)
 iptables -t mangle -A TPROXY_CHAIN -p tcp -m multiport --dports "$PORTS_TCP" -j TPROXY --on-port "$TPROXY_PORT" --on-ip "$TPROXY_ADDR" --tproxy-mark 0x1
-iptables -t mangle -A TPROXY_CHAIN -p udp -m multiport --dports "$PORTS_UDP" -j TPROXY --on-port "$TPROXY_PORT" --on-ip "$TPROXY_ADDR" --tproxy-mark 0x1
+iptables -t mangle -A TPROXY_CHAIN -p udp -m multiport --dports "$PORTS_UDP" -j TPROXY --on-port "$TPROXY_PORT" --on-ip "$TPROXY_ADDR" --tproxy-mark 0x2
 
 # Привязываем только к LAN-интерфейсу (важно при VPN!)
 iptables -t mangle -A PREROUTING -i "$LAN_IFACE" -j TPROXY_CHAIN
@@ -142,7 +142,7 @@ iptables -t mangle -A TPROXY_MARK -d 192.168.0.0/16 -j RETURN
 
 # Маркируем только выбранные порты (или весь TCP/UDP — закомментировано)
 iptables -t mangle -A TPROXY_MARK -p tcp -m multiport --dports "$PORTS_TCP" -j MARK --set-mark 0x1
-iptables -t mangle -A TPROXY_MARK -p udp -m multiport --dports "$PORTS_UDP" -j MARK --set-mark 0x1
+iptables -t mangle -A TPROXY_MARK -p udp -m multiport --dports "$PORTS_UDP" -j MARK --set-mark 0x2
 
 # Если хочешь весь трафик с сервера — раскомментируй и добавь исключения
 # iptables -t mangle -A TPROXY_MARK -p tcp -j MARK --set-mark 0x1
