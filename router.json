@@ -1,0 +1,68 @@
+{
+  "upstream_proxy": {
+    "stark": {
+      "server_addr": "x.x.x.x",
+      "server_port": 1070,
+      "auth": {
+        "username": "",
+        "pass": ""
+      },
+      "tag": "default"
+    },
+    "umay": {
+      "server_addr": "y.y.y.y",
+      "server_port": 1082,
+      "auth": {
+        "username": "",
+        "pass": ""
+      },
+      "tag": "kz"
+    }
+  },
+  "rules": [
+    {
+      "domains": [
+        "bbc.com",
+        "play.google.com"
+      ],
+      "geosite": [
+        "instagram",
+        "cloudfront",
+        "cloudflare",
+        "whatsapp",
+        "telegram"
+      ],
+      "tag": "default"
+    },
+    {
+      "domains": [
+        "kaspi.kz",
+        "ispace.kz",
+        "tele2.kz"
+      ],
+      "geoip": [
+        "KZ"
+      ],
+      "geosite": [
+        "discord",
+        "youtube"
+      ],
+      "tag": "kz"
+    },
+    {
+      "domains": [
+        "2gis.com",
+        "yandexcloud.net",
+        "yandex.net",
+        "vk.com",
+        "aliexpress.com",
+        "habr.com",
+        "habrastorage.com"
+      ],
+      "geoip": [
+        "RU"
+      ],
+      "tag": "direct"
+    }
+  ]
+}

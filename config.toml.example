@@ -1,0 +1,126 @@
+[general]
+listen = "0.0.0.0"
+port = 1080
+mode = "transparent"
+username = ""
+password = ""
+
+[client]
+# UDP-specific configuration (optional, defaults to same as TCP port)
+# udp_port = 12345
+
+# UDP desynchronization configuration
+udp_desync_enabled = false
+udp_desync_min_size = 64
+udp_desync_max_size = 256
+
+# ============ NEW: DNS Leak Prevention Configuration ============
+
+# Internal DNS Resolver (for cheburproxy itself)
+# Protocol options: plain, dot, doh, socks5
+# - plain: Traditional DNS (WARNING: DNS leak through ISP!)
+# - dot: DNS over TLS (encrypted, minimal DNS leak for bootstrap)
+# - doh: DNS over HTTPS (encrypted, optional SOCKS5 routing)
+# - socks5: DNS through upstream proxy (RECOMMENDED - zero DNS leaks!)
+dns_resolver_protocol = "socks5"
+dns_resolver_timeout = 5
+dns_resolver_cache_ttl = 3600
+dns_resolver_max_retries = 2
+
+# SOCKS5 DNS Configuration (recommended for maximum privacy)
+dns_socks5_proxy_addr = "127.0.0.1:1080"  # Your upstream SOCKS5 proxy
+dns_socks5_upstream_dns = "8.8.8.8:53"     # DNS server to query through proxy
+# dns_socks5_username = ""  # Optional SOCKS5 auth
+# dns_socks5_password = ""
+
+# Plain DNS Configuration (WARNING: DNS leaks!)
+# dns_plain_servers = ["8.8.8.8:53", "1.1.1.1:53"]
+
+# DNS over TLS Configuration
+# dns_dot_servers = [
+#     ["8.8.8.8", 853, "dns.google"],
+#     ["1.1.1.1", 853, "cloudflare-dns.com"]
+# ]
+
+# DNS over HTTPS Configuration
+# dns_doh_urls = ["https://dns.google/dns-query", "https://cloudflare-dns.com/dns-query"]
+# dns_doh_use_socks5 = false  # Route DoH through SOCKS5 proxy
+# dns_doh_socks5_proxy = "socks5://127.0.0.1:1080"
+
+# DNS Bootstrap (for DoT/DoH server domain resolution)
+dns_bootstrap_enabled = true
+dns_bootstrap_servers = ["8.8.8.8:53", "1.1.1.1:53"]
+
+# DNS Proxy Server (for LAN clients)
+# Listens on UDP port 53 and forwards queries through Internal DNS Resolver
+# This prevents LAN clients from making direct DNS queries to ISP
+dns_proxy_enabled = true
+dns_proxy_listen = "0.0.0.0"
+dns_proxy_port = 53
+dns_proxy_cache_size_limit = 10000
+dns_proxy_cache_ttl = 3600
+dns_proxy_log_queries = false  # Set to true for debugging
+
+# ============ Legacy DNS Settings (ignored with new system) ============
+# dns_enabled = false  # OLD setting - ignored
+# dns_listen_port = 53  # OLD setting - use dns_proxy_port instead
+# dns_cache_ttl = 3600  # OLD setting - use dns_resolver_cache_ttl/dns_proxy_cache_ttl
+
+# ============ Other Settings ============
+
+# Upstream proxy connection timeout in seconds (default: 10)
+upstream_proxy_timeout = 10
+
+# SNI routing enhancements
+availability_check = true
+
+# Legacy availability check timeout (seconds) - used if V2 options not set
+availability_check_timeout = 5
+
+# Availability Check V2 - Granular Timeouts (milliseconds)
+# If any of these are set, V2 mode is used with HTTP GET + body validation
+# Uncomment to enable granular control:
+# availability_connect_timeout = 800    # TCP connect timeout (ms)
+# availability_tls_timeout = 1200       # TLS handshake timeout (ms)
+# availability_ttfb_timeout = 1200      # Time to first byte timeout (ms)
+# availability_read_timeout = 800       # Body read timeout (ms)
+# availability_overall_budget = 3000    # Hard deadline for entire check (ms)
+# availability_max_redirects = 2        # Max redirects to follow
+# availability_min_bytes = 512          # Min body bytes to confirm availability
+# availability_max_bytes = 16384        # Max bytes to read (memory protection)
+
+availability_cache_ttl = 300
+
+# Client context management
+context_enabled = true
+context_ttl = 3600
+
+# ============ TPROXY Health Monitoring (transparent mode only) ============
+# Automatically monitors and recovers TPROXY routing rules after network outages.
+# Only active when mode = "transparent".
+
+# Enable automatic TPROXY rule recovery when rules are found missing (default: false).
+# When enabled without a recovery_script, only ip rule and ip route are restored
+# (not iptables rules). Set tproxy_recovery_script to enable full iptables recovery.
+auto_recover_tproxy = false
+
+# Network interface to monitor for state changes (e.g. "eth0", "br-lan").
+# When the interface comes back up, a health check is triggered immediately.
+# Leave empty (or omit) to disable interface monitoring.
+# tproxy_lan_iface = "eth0"
+
+# Path to a custom recovery script. If set, this script is executed instead of
+# the built-in ip rule/ip route recovery. Leave empty to use built-in recovery.
+# tproxy_recovery_script = "/usr/local/bin/restore-tproxy.sh"
+
+# The fwmark value used for TPROXY routing (must match iptables rules, default: 1)
+tproxy_fwmark = 1
+
+# Routing table number used for TPROXY (must match ip rule setup, default: 100)
+tproxy_route_table = 100
+
+# Interval between periodic TPROXY health checks in seconds (default: 300 = 5 min)
+tproxy_health_interval = 300
+
+# Interval for polling the network interface operstate in seconds (default: 10)
+tproxy_iface_poll_interval = 10

@@ -1,0 +1,20 @@
+[Unit]
+Description=Cheburproxy server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/local/cheburproxy
+ExecStart=/usr/local/cheburproxy/cheburproxy-server -c /usr/local/cheburproxy/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+#Environment=RUST_LOG=debug
+LimitNOFILE=2981888
+LimitNPROC=4000
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,53 @@
+[package]
+name = "cheburproxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cheburproxy"
+path = "src/main.rs"
+
+[[bin]]
+name = "cheburproxy-server"
+path = "src/cheburproxy_server.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio-socks = "0.5"
+dashmap = "5.5"
+arc-swap = "1"
+lazy_static = "1.4"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pki-types = "1.0"
+rustls-native-certs = "0.7"
+nix = { version = "0.27", features = ["socket", "uio"] }
+anyhow = "1"
+socket2 = { version = "0.5", features = ["all"] }
+toml = "0.8"
+hickory-resolver = { version = "0.24", features = ["dns-over-rustls", "dnssec-ring"] }
+hickory-proto = "0.24"
+base64 = "0.21"
+hdrhistogram = "7.5"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+lru = "0.12"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+rand = "0.8"
+patricia_tree = "0.6"
+openssl = { version = "0.10", features = ["vendored"] }
+webpki-roots = "0.22"
+maxminddb = "0.23"
+byteorder = "1.5"
+geosite-rs = "0.1.6"
+regex = "1.10"
+futures = "0.3"
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "socks"] }
+libc = "0.2.182"
+
+[lib]
+path = "src/transparent.rs"
