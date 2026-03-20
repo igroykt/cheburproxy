@@ -11,11 +11,10 @@ use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use socket2::SockRef;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
 use tokio::sync::{mpsc, Mutex, Semaphore, OwnedSemaphorePermit};
 
@@ -23,7 +22,6 @@ use crate::router::{Proxy, UdpMode};
 use crate::rule::{RuleEngine, RoutingDecision};
 use crate::find_domain_by_ip;
 use crate::proxy_health;
-use crate::proxy::{self, ProxyError};
 use crate::transparent::{connect_tcp_with_mark, set_socket_mark};
 use crate::udp_tunnel_frame;
 

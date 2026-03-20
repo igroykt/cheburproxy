@@ -12,7 +12,6 @@ use log::{debug, info, warn};
 use lazy_static::lazy_static;
 use dashmap::DashMap;
 use std::hash::{Hash, Hasher};
-use socket2::SockRef;
 
 // Constants for better maintainability
 const CONNECTION_POOL_TIMEOUT_SECS: u64 = 60;

@@ -28,11 +28,10 @@ mod client_context;
 pub mod udp_tunnel_frame;  // UDP-over-TCP tunnel framing protocol
 
 use dashmap::DashMap;
-use hickory_resolver::{config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts}, TokioAsyncResolver};
+use hickory_resolver::TokioAsyncResolver;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
-use tokio::time::timeout;
+use tokio::sync::OwnedSemaphorePermit;
 use thiserror::Error;
 
 use crate::router::load_config;
@@ -42,8 +41,8 @@ use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 
 static ACCEPTED_CONNS_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ZERO_TRAFFIC_STREAK: AtomicU32 = AtomicU32::new(0);
-use crate::transparent::{get_original_dst, create_transparent_tcp_socket, create_transparent_tcp_socket_default};
-use crate::udp_proxy::{run_udp_proxy, Config, handle_udp_packet, SessionKey, UdpSession, TransparentUdpSender};
+use crate::transparent::{get_original_dst, create_transparent_tcp_socket_default};
+use crate::udp_proxy::{run_udp_proxy, Config, handle_udp_packet, SessionKey, UdpSession};
 // use crate::dns_proxy::run_dns_proxy;  // Removed - unstable
 use crate::sni::extract_sni;
 use std::net::SocketAddr;

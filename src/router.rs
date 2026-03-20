@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
 use std::{
     collections::HashMap,
-    fmt,
     path::Path,
 };
 use tokio::io::AsyncReadExt;

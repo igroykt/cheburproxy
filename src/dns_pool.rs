@@ -8,7 +8,6 @@ use hickory_resolver::{
     TokioAsyncResolver,
 };
 use std::{
-    collections::VecDeque,
     net::SocketAddr,
     sync::{Arc, Mutex},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},

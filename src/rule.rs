@@ -1,5 +1,5 @@
 use crate::router::{Proxy, Router, Rule};
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use dashmap::DashMap;
 use log::{debug, info, warn};
 use regex::Regex;
@@ -11,10 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Semaphore};
 use tokio::time::Instant as TokioInstant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt};
 use tokio_rustls::{TlsConnector, rustls::ClientConfig};
-use rustls::RootCertStore;
-use rustls_pki_types::ServerName;
 use crate::client_context::get_top_level_domain;
 use crate::transparent::connect_tcp_with_mark;
 // Структура для игнорирования валидности сертификатов
