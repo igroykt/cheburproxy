@@ -32,7 +32,8 @@
         "whatsapp",
         "telegram"
       ],
-      "tag": "default"
+      "tag": "default",
+      "udp_mode": "tcp_tunnel"
     },
     {
       "domains": [
@@ -47,7 +48,8 @@
         "discord",
         "youtube"
       ],
-      "tag": "kz"
+      "tag": "kz",
+      "udp_mode": "tcp_tunnel"
     },
     {
       "domains": [
