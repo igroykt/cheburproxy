@@ -60,6 +60,11 @@ pub trait DnsProtocolHandler: Send + Sync {
     async fn query_raw(&self, _query_data: &[u8]) -> DnsResult<Vec<u8>> {
         Err(DnsError::QueryFailed("Raw query forwarding not supported by this handler".to_string()))
     }
+
+    /// Perform a reverse DNS lookup (PTR) for an IP address
+    async fn reverse_query(&self, _ip: IpAddr) -> DnsResult<String> {
+        Err(DnsError::QueryFailed("Reverse query not supported by this handler".to_string()))
+    }
     
     /// Get protocol name for logging/debugging
     fn protocol_name(&self) -> &'static str;

@@ -24,6 +24,9 @@ use crate::find_domain_by_ip;
 use crate::proxy_health;
 use crate::transparent::{connect_tcp_with_mark, set_socket_mark};
 use crate::udp_tunnel_frame;
+use crate::dns_resolver::InternalDnsResolver;
+
+type DomainCache = Arc<DashMap<IpAddr, (String, Instant)>>;
 
 // Constants for better maintainability and performance
 // P1-5 FIX: Reduced from 65535 to 4096. Each UDP session spawns a response task
@@ -266,12 +269,8 @@ fn generate_fake_udp_packet(min_size: usize, max_size: usize) -> Vec<u8> {
     assert!(min_size <= max_size, "min_size must be <= max_size");
 
     let size = thread_rng().gen_range(min_size..=max_size);
-    let mut packet = Vec::with_capacity(size);
-    // Use unsafe initialization for better performance with random data
-    unsafe {
-        packet.set_len(size);
-        thread_rng().fill(&mut packet[..]);
-    }
+    let mut packet = vec![0u8; size];
+    thread_rng().fill(&mut packet[..]);
     packet
 }
 
@@ -2006,7 +2005,7 @@ pub async fn handle_udp_packet(
                 // Persistent error (EACCES, EPERM, etc.) — trigger circuit breaker, do NOT retry.
                 // Retrying will just waste TCP connections and UDP sockets.
                 if let Some(proxy_addr) = proxy_addr_from_route(key.route(), &proxy_opt_for_retry) {
-                    proxy_health::record_failure(&proxy_addr, &e.to_string());
+                    proxy_health::record_failure(&proxy_addr, &e);
                     error!(
                         "UDP send persistent error for {} -> {} via {} ({}), circuit breaker notified: {}",
                         client_addr, target, proxy_addr, route_label, e
@@ -2036,7 +2035,7 @@ pub async fn handle_udp_packet(
                             if is_persistent_send_error(&e2) {
                                 remove_udp_session(&key, &sessions);
                                 if let Some(proxy_addr) = proxy_addr_from_route(key.route(), &proxy_opt_for_cb) {
-                                    proxy_health::record_failure(&proxy_addr, &e2.to_string());
+                                    proxy_health::record_failure(&proxy_addr, &e2);
                                     error!(
                                         "UDP send retry persistent error for {} -> {} via {}, circuit breaker notified: {}",
                                         client_addr, target, proxy_addr, e2
@@ -2064,21 +2063,30 @@ pub async fn handle_udp_packet(
 /// Check if an error is persistent (not worth retrying).
 ///
 /// Persistent errors include:
-/// - EACCES (os error 13): Permission denied — typically caused by firewall/ICMP admin-prohibited
 /// - EPERM (os error 1): Operation not permitted — security policy rejection
+/// - EACCES (os error 13): Permission denied — typically caused by firewall/ICMP admin-prohibited
 /// - ENETUNREACH (os error 101): Network unreachable — no route to host
 /// - EHOSTUNREACH (os error 113): Host unreachable — no path to destination
 ///
-/// These errors will not resolve by retrying with a new session, so we should
-/// trigger the circuit breaker and avoid wasting resources on retries.
+/// Uses `raw_os_error()` instead of string matching to avoid:
+/// - False positives (e.g. "os error 101" matching "os error 1010")
+/// - Unnecessary `to_string()` allocation on every error
 fn is_persistent_send_error(err: &anyhow::Error) -> bool {
+    // Try to extract the underlying std::io::Error for precise matching
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        return matches!(
+            io_err.raw_os_error(),
+            Some(1)   // EPERM
+            | Some(13)  // EACCES
+            | Some(101) // ENETUNREACH
+            | Some(113) // EHOSTUNREACH
+        );
+    }
+    // Fallback to string matching for wrapped errors (e.g. anyhow wrapping anyhow)
     let err_str = err.to_string();
-    err_str.contains("os error 13)")  // EACCES - Permission denied (closing ) avoids matching os error 130, 131, etc.)
-        || err_str.contains("os error 1)")  // EPERM - note the ) to avoid matching os error 1xx
-        || err_str.contains("os error 101") // ENETUNREACH - Network unreachable
-        || err_str.contains("os error 113") // EHOSTUNREACH - No route to host
-        || err_str.contains("Permission denied")
+    err_str.contains("Permission denied")
         || err_str.contains("Network is unreachable")
+        || err_str.contains("No route to host")
 }
 
 /// Extract proxy address from a SessionRoute, formatted as "host:port"
@@ -2192,7 +2200,7 @@ async fn create_new_session_internal(
                         session
                     }
                     Err(e) => {
-                        proxy_health::record_failure(&proxy_addr, &e.to_string());
+                        proxy_health::record_failure(&proxy_addr, &e);
                         warn!(
                             "TCP tunnel UDP session failed for {} (no fallback): {}",
                             proxy_addr, e
@@ -2218,7 +2226,7 @@ async fn create_new_session_internal(
                         session
                     }
                     Err(e) => {
-                        proxy_health::record_failure(&proxy_addr, &e.to_string());
+                        proxy_health::record_failure(&proxy_addr, &e);
                         warn!(
                             "SOCKS5 UDP association failed for {} (no fallback): {}",
                             proxy_addr, e
@@ -2273,8 +2281,9 @@ async fn create_new_session_internal(
 pub async fn run_udp_proxy(
     rules: RuleEngine,
     config: Arc<Config>,
-    domain_cache: Arc<DashMap<std::net::IpAddr, (String, std::time::Instant)>>,
+    domain_cache: DomainCache,
     upstream_proxy_timeout: Duration,
+    _resolver: Arc<InternalDnsResolver>,
 ) -> Result<()> {
     info!("Starting UDP proxy on port {} with config: desync_enabled={}, min_size={}, max_size={}",
           config.port, config.udp_desync_enabled, config.udp_desync_min_size, config.udp_desync_max_size);
@@ -2318,37 +2327,20 @@ pub async fn run_udp_proxy(
             let start_time = Instant::now();
             let mut removed = 0usize;
 
-            // Collect expired session keys efficiently
-            let keys_to_remove: Vec<SessionKey> = cleanup_sessions
-                .iter()
-                .filter_map(|entry| {
-                    let session = entry.value();
-                    if session.is_expired() {
-                        Some(entry.key().clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Remove expired sessions - first mark them inactive to stop response tasks
-            for key in &keys_to_remove {
-                if let Some(session) = cleanup_sessions.get(key) {
-                    // Signal response task to stop
+            // Single-pass cleanup using retain() — no TOCTOU race, no extra allocations.
+            // Previously, keys were collected into a Vec, sessions were marked inactive,
+            // a 100ms sleep was inserted, then sessions were removed one-by-one.
+            // This was racy (new packets could hit inactive sessions) and slow.
+            cleanup_sessions.retain(|_, session| {
+                if session.is_expired() {
                     session.mark_inactive();
+                    GLOBAL_UDP_SESSION_COUNT.fetch_sub(1, Ordering::Relaxed);
+                    removed += 1;
+                    false // remove
+                } else {
+                    true  // keep
                 }
-            }
-            
-            // Give response tasks time to notice the inactive flag and exit gracefully
-            if !keys_to_remove.is_empty() {
-                sleep(Duration::from_millis(100)).await;
-            }
-            
-            // Now remove the sessions
-            for key in keys_to_remove {
-                remove_udp_session(&key, &cleanup_sessions);
-                removed += 1;
-            }
+            });
 
             // Log cleanup statistics with session count
             let total_sessions = cleanup_sessions.len();
@@ -2564,9 +2556,18 @@ pub async fn run_udp_proxy(
 
     // Run both listeners. This avoids dependency on v4-mapped IPv6 sockets and
     // guarantees IPv4 QUIC (UDP/443) reaches the proxy.
-    spawn_receiver(ipv4_socket.clone(), "ipv4");
-    if let Some(ref ipv6_socket) = ipv6_socket {
-        spawn_receiver(ipv6_socket.clone(), "ipv6");
+    let ipv4_handle = spawn_receiver(ipv4_socket.clone(), "ipv4");
+    if let Some(ipv6_socket) = ipv6_socket {
+        let ipv6_handle = spawn_receiver(ipv6_socket.clone(), "ipv6");
+        match tokio::try_join!(ipv4_handle, ipv6_handle) {
+            Ok(_) => info!("UDP proxy listeners finished normally"),
+            Err(e) => return Err(anyhow!("UDP proxy task panicked or failed: {}", e)),
+        }
+    } else {
+        match ipv4_handle.await {
+            Ok(_) => info!("UDP proxy listener finished normally"),
+            Err(e) => return Err(anyhow!("UDP proxy task panicked or failed: {}", e)),
+        }
     }
     
     Ok(())

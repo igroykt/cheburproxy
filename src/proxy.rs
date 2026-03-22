@@ -402,7 +402,11 @@ async fn get_pooled_proxy_stream(proxy: &Proxy, target_host: &str, target_port: 
     let mut unused = Vec::new();
 
     for (mut stream, created, permit) in to_try {
-        if found.is_none() && created.elapsed() < Duration::from_secs(CONNECTION_POOL_TIMEOUT_SECS) {
+        let elapsed = created.elapsed();
+        let is_within_idle_timeout = elapsed < Duration::from_secs(CONNECTION_POOL_TIMEOUT_SECS);
+        let is_within_max_lifetime = elapsed < Duration::from_secs(MAX_CONNECTION_LIFETIME_SECS);
+
+        if found.is_none() && is_within_idle_timeout && is_within_max_lifetime {
             // Verify connection is still alive with a quick peek (OUTSIDE lock).
             // A peek timeout (Err from outer timeout) means no data is buffered yet —
             // the connection is idle but alive (normal for SOCKS5 proxies waiting for
@@ -460,14 +464,13 @@ async fn get_pooled_proxy_stream(proxy: &Proxy, target_host: &str, target_port: 
             s
         }
         Ok(Err(e)) => {
-            let err_msg = format!("connect error: {}", e);
-            proxy_health::record_failure(&proxy_addr, &err_msg);
+            proxy_health::record_failure(&proxy_addr, &e);
             warn!("Proxy {} connect failed: {}", proxy_addr, e);
             return Err(ProxyError::ConnectionTimeout { duration: upstream_proxy_timeout });
         }
         Err(_) => {
-            let err_msg = format!("connect timeout ({}s)", upstream_proxy_timeout.as_secs());
-            proxy_health::record_failure(&proxy_addr, &err_msg);
+            let msg = format!("connect timeout ({}s)", upstream_proxy_timeout.as_secs());
+            proxy_health::record_failure(&proxy_addr, &msg);
             warn!("Proxy {} connect timeout", proxy_addr);
             return Err(ProxyError::ConnectionTimeout { duration: upstream_proxy_timeout });
         }
@@ -479,8 +482,7 @@ async fn get_pooled_proxy_stream(proxy: &Proxy, target_host: &str, target_port: 
             Ok((stream, permit))
         }
         Err(e) => {
-            let err_msg = format!("SOCKS5 handshake failed: {}", e);
-            proxy_health::record_failure(&proxy_addr, &err_msg);
+            proxy_health::record_failure(&proxy_addr, &e);
             Err(e)
         }
     }
@@ -491,7 +493,9 @@ fn cleanup_stale_connections(key: &ProxyKey) {
     if let Some(mut entry) = CONNECTION_POOL.get_mut(key) {
         let original_len = entry.len();
         entry.retain(|(_, created, _)| {
-            created.elapsed() < Duration::from_secs(CONNECTION_POOL_TIMEOUT_SECS)
+            let elapsed = created.elapsed();
+            elapsed < Duration::from_secs(CONNECTION_POOL_TIMEOUT_SECS) &&
+            elapsed < Duration::from_secs(MAX_CONNECTION_LIFETIME_SECS)
         });
         let cleaned = original_len - entry.len();
         if cleaned > 0 {

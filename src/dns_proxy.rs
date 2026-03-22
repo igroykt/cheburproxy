@@ -25,6 +25,9 @@ use tokio::net::UdpSocket;
 /// Maximum DNS UDP message size (EDNS0 default)
 const MAX_DNS_UDP_SIZE: usize = 4096;
 
+/// Maximum concurrent DNS query handler tasks to prevent OOM under DNS floods.
+const MAX_CONCURRENT_DNS_QUERIES: usize = 512;
+
 /// DNS proxy configuration
 #[derive(Debug, Clone)]
 pub struct DnsProxyConfig {
@@ -114,6 +117,11 @@ impl DnsProxy {
             self.resolver.protocol_name());
         
         let mut query_count: u64 = 0;
+        // Pre-allocate receive buffer outside the loop to avoid 4KB allocation per packet.
+        // Only the actual data portion (typically 50-200 bytes) is cloned for the spawned handler.
+        let mut recv_buf = vec![0u8; MAX_DNS_UDP_SIZE];
+        // Limit concurrent query handler tasks to prevent OOM during DNS floods
+        let query_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DNS_QUERIES));
         
         loop {
             // Wait for readable
@@ -121,10 +129,10 @@ impl DnsProxy {
             
             // Use try_io with recvmsg to get both the query data and the destination IP
             let recv_result = socket.try_io(tokio::io::Interest::READABLE, || {
-                let mut buf = vec![0u8; MAX_DNS_UDP_SIZE];
-                let (size, src_addr, dst_ip) = recv_with_pktinfo(raw_fd, &mut buf)?;
-                buf.truncate(size);
-                Ok((buf, src_addr, dst_ip))
+                let (size, src_addr, dst_ip) = recv_with_pktinfo(raw_fd, &mut recv_buf)?;
+                // Clone only the actual data bytes (not the full 4KB buffer)
+                let query_data = recv_buf[..size].to_vec();
+                Ok((query_data, src_addr, dst_ip))
             });
             
             match recv_result {
@@ -139,9 +147,18 @@ impl DnsProxy {
                     let socket_clone = socket.clone();
                     let proxy_clone = self.clone();
                     let fd = raw_fd;
+                    let sem = query_semaphore.clone();
                     
-                    // Spawn handler for this query
+                    // Spawn handler for this query with concurrency limit
                     tokio::spawn(async move {
+                        let _permit = match sem.try_acquire() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                warn!("DNS Proxy: query limit reached ({}), dropping query from {}",
+                                    MAX_CONCURRENT_DNS_QUERIES, client_addr);
+                                return;
+                            }
+                        };
                         if let Err(e) = proxy_clone.handle_query(query_data, client_addr, dst_ip, socket_clone, fd).await {
                             error!("DNS Proxy: Error handling query from {}: {}", client_addr, e);
                         }

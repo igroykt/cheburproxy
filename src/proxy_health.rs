@@ -84,14 +84,18 @@ pub enum FailureType {
 impl FailureType {
     /// Classify an error string into a failure type using heuristics.
     pub fn classify(error: &str) -> Self {
-        let lower = error.to_lowercase();
-        if lower.contains("auth") || lower.contains("authentication failed") {
+        // Simple case-insensitive check without to_lowercase() allocation for common patterns
+        let is_match = |patterns: &[&str]| {
+            patterns.iter().any(|&p| {
+                error.as_bytes().windows(p.len()).any(|w| w.eq_ignore_ascii_case(p.as_bytes()))
+            })
+        };
+
+        if is_match(&["auth", "authentication failed"]) {
             FailureType::AuthFailure
-        } else if lower.contains("invalid socks5") || lower.contains("protocol error")
-            || lower.contains("unexpected version") || lower.contains("unsupported")
-        {
+        } else if is_match(&["invalid socks5", "protocol error", "unexpected version", "unsupported"]) {
             FailureType::ProtocolError
-        } else if lower.contains("timeout") || lower.contains("timed out") {
+        } else if is_match(&["timeout", "timed out"]) {
             FailureType::Transient
         } else {
             FailureType::NetworkError
@@ -241,14 +245,16 @@ pub fn is_healthy(proxy_addr: &str) -> bool {
 
 /// Convenience: record a connection failure for a proxy.
 /// Automatically classifies the failure type from the error message.
-pub fn record_failure(proxy_addr: &str, error: &str) {
-    let failure_type = FailureType::classify(error);
-    get().record_failure(proxy_addr, error, failure_type);
+/// Record a proxy failure and classify it automatically.
+pub fn record_failure(proxy_addr: &str, error: &dyn fmt::Display) {
+    let err_str = error.to_string(); // Single allocation for classification and storage
+    let failure_type = FailureType::classify(&err_str);
+    get().record_failure(proxy_addr, &err_str, failure_type);
 }
 
-/// Record a connection failure with explicit failure type classification.
-pub fn record_failure_typed(proxy_addr: &str, error: &str, failure_type: FailureType) {
-    get().record_failure(proxy_addr, error, failure_type);
+/// Record a proxy failure with a pre-classified type.
+pub fn record_failure_typed(proxy_addr: &str, error: &dyn fmt::Display, failure_type: FailureType) {
+    get().record_failure(proxy_addr, &error.to_string(), failure_type);
 }
 
 /// Convenience: record a successful connection through a proxy.

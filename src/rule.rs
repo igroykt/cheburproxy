@@ -71,7 +71,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 use geosite_rs::{decode_geosite, decode_geoip};
 use geosite_rs::GeoSiteList;
 use geosite_rs::GeoIpList;
-use hickory_resolver::{config::{ResolverConfig, ResolverOpts, NameServerConfig, Protocol}, TokioAsyncResolver};
+use crate::dns_resolver::InternalDnsResolver;
 
 // Constants for better maintainability
 const CACHE_DURATION_SECONDS: u64 = 600;
@@ -272,8 +272,8 @@ pub struct RuleEngine {
     proxies: Arc<HashMap<String, Proxy>>,
     /// Cache for routing decisions to improve performance
     cache: Arc<DashMap<String, (RoutingDecision, Instant)>>,
-    /// DNS resolver for SNI domain resolution
-    resolver: Arc<TokioAsyncResolver>,
+    /// DNS resolver for SNI domain resolution and availability checks
+    resolver: Arc<InternalDnsResolver>,
     /// Cache for DNS resolutions
     dns_cache: Arc<DashMap<String, (IpAddr, Instant)>>,
     /// Cache for availability checks
@@ -404,10 +404,17 @@ impl DomainPattern {
 
     /// Check if the pattern matches the given domain
     fn matches(&self, domain: &str) -> bool {
-        // Нормализуем входной домен один раз
         let domain = Self::normalize(domain);
+        self.matches_normalized(&domain)
+    }
+
+    /// Check if the pattern matches a **pre-normalized** (lowercased, dot-trimmed) domain.
+    /// Avoids the String allocation in `normalize()` — use this on hot paths where the
+    /// caller already holds a lowercased domain (e.g. `get_routing_decision`).
+    #[inline]
+    fn matches_normalized(&self, domain: &str) -> bool {
         match self {
-            DomainPattern::DomainAndSubs(p) => Self::ends_with_domain_boundary(&domain, p),
+            DomainPattern::DomainAndSubs(p) => Self::ends_with_domain_boundary(domain, p),
         }
     }
 }
@@ -433,22 +440,17 @@ pub enum RoutingDecision {
 }
 
 impl RuleEngine {
-    /// Create a new RuleEngine from configuration with default settings
-    pub fn from_config(cfg: Router) -> anyhow::Result<Self> {
-        Self::from_config_with_options(cfg, RuleEngineConfig::default())
+    /// Create a new RuleEngine from configuration with default settings and a shared DNS resolver
+    pub fn from_config(cfg: Router, resolver: Arc<InternalDnsResolver>) -> anyhow::Result<Self> {
+        Self::from_config_with_resolver(cfg, RuleEngineConfig::default(), resolver)
     }
 
-    /// Create a new RuleEngine with custom configuration
-    pub fn from_config_with_options(cfg: Router, config: RuleEngineConfig) -> anyhow::Result<Self> {
+    /// Create a new RuleEngine with custom configuration and a shared DNS resolver
+    pub fn from_config_with_resolver(cfg: Router, config: RuleEngineConfig, resolver: Arc<InternalDnsResolver>) -> anyhow::Result<Self> {
         let proxies = Self::load_proxies(&cfg.upstream_proxy, &config)?;
         let geoip_countries = Self::load_geoip_data(&config)?;
         let geosite_categories = Self::load_geosite_data(&config)?;
         let rules = Self::process_rules(cfg.rules, &config)?;
-
-        let mut resolver_config = ResolverConfig::new();
-        resolver_config.add_name_server(NameServerConfig::new("8.8.8.8:53".parse().unwrap(), Protocol::Udp));
-        let resolver_opts = ResolverOpts::default();
-        let resolver = TokioAsyncResolver::tokio(resolver_config, resolver_opts);
 
         Ok(RuleEngine {
             rules: Arc::new(rules),
@@ -456,7 +458,7 @@ impl RuleEngine {
             geosite_categories,
             proxies: Arc::new(proxies),
             cache: Arc::new(DashMap::new()),
-            resolver: Arc::new(resolver),
+            resolver,
             dns_cache: Arc::new(DashMap::new()),
             availability_cache: Arc::new(DashMap::new()),
             availability_sem: Arc::new(Semaphore::new(AVAILABILITY_MAX_PARALLEL)),
@@ -472,7 +474,7 @@ impl RuleEngine {
         config: RuleEngineConfig,
         geoip_countries: Arc<HashMap<String, Vec<CidrBlock>>>,
         geosite_categories: Arc<HashMap<String, OptimizedGeoSite>>,
-        resolver: Arc<TokioAsyncResolver>,
+        resolver: Arc<InternalDnsResolver>,
     ) -> anyhow::Result<Self> {
         let proxies = Self::load_proxies(&cfg.upstream_proxy, &config)?;
         let rules = Self::process_rules(cfg.rules, &config)?;
@@ -499,7 +501,7 @@ impl RuleEngine {
     pub fn extract_static_geodata(&self) -> (
         Arc<HashMap<String, Vec<CidrBlock>>>,
         Arc<HashMap<String, OptimizedGeoSite>>,
-        Arc<TokioAsyncResolver>,
+        Arc<InternalDnsResolver>,
     ) {
         (
             self.geoip_countries.clone(),
@@ -767,9 +769,9 @@ impl RuleEngine {
         None
     }
 
-    /// Fast domain pattern matching
+    /// Fast domain pattern matching (accepts pre-normalized domain)
     fn domain_matches(&self, patterns: &[DomainPattern], domain: &str) -> bool {
-        patterns.iter().any(|pattern| pattern.matches(domain))
+        patterns.iter().any(|pattern| pattern.matches_normalized(domain))
     }
 
     /// Geosite category matching - optimized with HashSet + suffix matching
@@ -922,19 +924,22 @@ impl RuleEngine {
 
         match tokio::time::timeout(
             Duration::from_millis(DEFAULT_DNS_TIMEOUT_MS),
-            self.resolver.lookup_ip(domain)
+            self.resolver.resolve(domain)
         ).await {
-            Ok(Ok(response)) => {
-                if let Some(ip) = response.iter().next() {
+            Ok(Ok(ips)) => {
+                if let Some(ip) = ips.into_iter().next() {
                     self.dns_cache.insert(domain.to_string(), (ip, Instant::now()));
                     Some(ip)
                 } else {
                     None
                 }
             }
-            Ok(Err(_)) => None, // Resolver error
+            Ok(Err(e)) => {
+                debug!("Rule Engine: DNS resolution for '{}' failed: {}", domain, e);
+                None
+            }
             Err(_) => {
-                debug!("DNS lookup for '{}' timed out after {}ms", domain, DEFAULT_DNS_TIMEOUT_MS);
+                debug!("Rule Engine: DNS lookup for '{}' timed out after {}ms", domain, DEFAULT_DNS_TIMEOUT_MS);
                 None
             }
         }
@@ -1036,20 +1041,24 @@ impl RuleEngine {
             }
         }
 
-        match self.resolver.lookup_ip(domain).await {
-            Ok(response) => {
+        match self.resolver.resolve(domain).await {
+            Ok(ips) => {
                 // Prefer IPv4 over IPv6 for faster and more reliable connections
-                let ipv4 = response.iter().find(|ip| ip.is_ipv4());
-                let ipv6 = response.iter().find(|ip| ip.is_ipv6());
+                let ipv4 = ips.iter().find(|ip| ip.is_ipv4());
+                let ipv6 = ips.iter().find(|ip| ip.is_ipv6());
                 
                 if let Some(ip) = ipv4.or(ipv6) {
+                    let ip = *ip;
                     self.dns_cache.insert(domain.to_string(), (ip, Instant::now()));
                     Some(ip)
                 } else {
                     None
                 }
             }
-            Err(_) => None,
+            Err(e) => {
+                debug!("Rule Engine: DNS lookup (prefer-ipv4) for '{}' failed: {}", domain, e);
+                None
+            }
         }
     }
 

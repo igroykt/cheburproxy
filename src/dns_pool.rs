@@ -9,8 +9,8 @@ use hickory_resolver::{
 };
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicU32, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -45,6 +45,7 @@ impl Default for DnsConfig {
 }
 
 /// Statistics for monitoring DNS resolver pool performance
+/// This is the snapshot struct returned by `stats()` — NOT used for hot-path storage.
 #[derive(Debug, Default, Clone)]
 pub struct DnsPoolStats {
     /// Total number of DNS queries made
@@ -85,7 +86,44 @@ impl DnsPoolStats {
     }
 }
 
-/// Thread-safe DNS resolver pool with advanced features
+/// Lock-free atomic statistics counters for hot-path updates.
+/// Avoids Mutex contention that previously occurred on every DNS query.
+struct AtomicDnsStats {
+    total_queries: AtomicU64,
+    successful_queries: AtomicU64,
+    failed_queries: AtomicU64,
+    /// Exponential moving average of response time, stored as milliseconds.
+    avg_response_time_ms: AtomicU64,
+}
+
+impl AtomicDnsStats {
+    fn new() -> Self {
+        Self {
+            total_queries: AtomicU64::new(0),
+            successful_queries: AtomicU64::new(0),
+            failed_queries: AtomicU64::new(0),
+            avg_response_time_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot current counters into a DnsPoolStats struct (cold path).
+    fn snapshot(&self, active_queries: usize, pool_size: usize) -> DnsPoolStats {
+        DnsPoolStats {
+            total_queries: self.total_queries.load(Ordering::Relaxed),
+            successful_queries: self.successful_queries.load(Ordering::Relaxed),
+            failed_queries: self.failed_queries.load(Ordering::Relaxed),
+            avg_response_time_ms: self.avg_response_time_ms.load(Ordering::Relaxed),
+            cache_hits: 0,
+            cache_misses: 0,
+            pool_utilization_percent: ((active_queries * 100) / pool_size.max(1)).min(100) as f32,
+        }
+    }
+}
+
+/// Thread-safe DNS resolver pool with advanced features.
+///
+/// Hot-path operations (get_resolver, update_resolver_health) are fully lock-free,
+/// using AtomicBool health flags, AtomicU32 failure counters, and AtomicU64 stats.
 pub struct DnsResolverPool {
     /// Pool of DNS resolver instances
     resolvers: Vec<Arc<TokioAsyncResolver>>,
@@ -93,26 +131,14 @@ pub struct DnsResolverPool {
     index: AtomicUsize,
     /// Configuration settings
     config: DnsConfig,
-    /// Performance statistics (protected by mutex for interior mutability)
-    stats: Arc<Mutex<DnsPoolStats>>,
-    /// Health status of each resolver
-    health_status: Arc<Mutex<Vec<ResolverHealth>>>,
+    /// Lock-free performance statistics (hot path)
+    atomic_stats: Arc<AtomicDnsStats>,
     /// Per-resolver healthy flag — lock-free, used in hot-path selection.
-    /// Updated via update_resolver_health(), read by get_resolver().
-    health_flags: Vec<std::sync::atomic::AtomicBool>,
-    /// Number of queries currently in-flight (incremented on checkout, decremented on result).
+    health_flags: Vec<AtomicBool>,
+    /// Per-resolver consecutive failure counter — lock-free.
+    failure_counts: Vec<AtomicU32>,
+    /// Number of queries currently in-flight.
     active_queries: AtomicUsize,
-}
-
-/// Health status for individual resolvers
-#[derive(Debug, Clone, Default)]
-struct ResolverHealth {
-    /// Last successful operation timestamp
-    last_success: Option<Instant>,
-    /// Number of consecutive failures
-    failure_count: u32,
-    /// Whether this resolver is currently healthy
-    is_healthy: bool,
 }
 
 impl DnsResolverPool {
@@ -139,24 +165,24 @@ impl DnsResolverPool {
         }
 
         let mut resolvers = Vec::with_capacity(config.pool_size);
-        let mut health_status = Vec::with_capacity(config.pool_size);
         let mut health_flags = Vec::with_capacity(config.pool_size);
+        let mut failure_counts = Vec::with_capacity(config.pool_size);
 
         // Create resolver instances for the pool
         for _ in 0..config.pool_size {
             let resolver = Self::create_resolver(&config)?;
             resolvers.push(Arc::new(resolver));
-            health_status.push(ResolverHealth::default());
             health_flags.push(AtomicBool::new(true)); // All start healthy
+            failure_counts.push(AtomicU32::new(0));
         }
 
         Ok(Self {
             resolvers,
             index: AtomicUsize::new(0),
             config,
-            stats: Arc::new(Mutex::new(DnsPoolStats::default())),
-            health_status: Arc::new(Mutex::new(health_status)),
+            atomic_stats: Arc::new(AtomicDnsStats::new()),
             health_flags,
+            failure_counts,
             active_queries: AtomicUsize::new(0),
         })
     }
@@ -259,57 +285,54 @@ impl DnsResolverPool {
         }
     }
 
-    /// Update resolver health status based on query results
+    /// Update resolver health status based on query results.
+    ///
+    /// **Fully lock-free** — uses atomic counters and flags only.
+    /// Previously this method acquired two Mutex locks on every DNS query,
+    /// causing contention under load.
     ///
     /// # Arguments
     /// * `resolver_index` - Index of the resolver that was used
     /// * `success` - Whether the query was successful
     /// * `response_time` - How long the query took (optional)
     pub fn update_resolver_health(&self, resolver_index: usize, success: bool, response_time: Option<Duration>) {
-        let mut health_status = self.health_status.lock().unwrap();
-        let mut stats = self.stats.lock().unwrap();
-
-        if let Some(health) = health_status.get_mut(resolver_index) {
-            if success {
-                health.last_success = Some(Instant::now());
-                health.failure_count = 0;
-                health.is_healthy = true;
-
-                stats.successful_queries += 1;
-
-                if let Some(rt) = response_time {
-                    let rt_ms = rt.as_millis() as u64;
-                    // Update rolling average (simplified)
-                    stats.avg_response_time_ms =
-                        (stats.avg_response_time_ms + rt_ms) / 2;
-                }
-            } else {
-                health.failure_count += 1;
-                stats.failed_queries += 1;
-
-                // Mark as unhealthy after 3 consecutive failures
-                if health.failure_count >= 3 {
-                    health.is_healthy = false;
-                }
-            }
-
-            // Sync lock-free health flag for hot-path selection
-            if let Some(flag) = self.health_flags.get(resolver_index) {
-                flag.store(health.is_healthy, Ordering::Relaxed);
-            }
-
-            stats.total_queries += 1;
-            let pool_size = self.resolvers.len().max(1);
-            let prev_active = self.active_queries.fetch_sub(1, Ordering::Relaxed);
-            let active = prev_active.saturating_sub(1);
-            stats.pool_utilization_percent = ((active * 100) / pool_size).min(100) as f32;
+        if resolver_index >= self.resolvers.len() {
+            return;
         }
+
+        if success {
+            // Reset failure counter
+            self.failure_counts[resolver_index].store(0, Ordering::Relaxed);
+            self.health_flags[resolver_index].store(true, Ordering::Relaxed);
+
+            self.atomic_stats.successful_queries.fetch_add(1, Ordering::Relaxed);
+
+            if let Some(rt) = response_time {
+                let rt_ms = rt.as_millis() as u64;
+                // Approximate exponential moving average without locks.
+                // load + store is not perfectly atomic but acceptable for stats.
+                let prev = self.atomic_stats.avg_response_time_ms.load(Ordering::Relaxed);
+                let new_avg = if prev == 0 { rt_ms } else { (prev + rt_ms) / 2 };
+                self.atomic_stats.avg_response_time_ms.store(new_avg, Ordering::Relaxed);
+            }
+        } else {
+            let failures = self.failure_counts[resolver_index].fetch_add(1, Ordering::Relaxed) + 1;
+            self.atomic_stats.failed_queries.fetch_add(1, Ordering::Relaxed);
+
+            // Mark as unhealthy after 3 consecutive failures
+            if failures >= 3 {
+                self.health_flags[resolver_index].store(false, Ordering::Relaxed);
+            }
+        }
+
+        self.atomic_stats.total_queries.fetch_add(1, Ordering::Relaxed);
+        self.active_queries.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Get comprehensive statistics about the DNS pool
+    /// Get comprehensive statistics about the DNS pool (cold path)
     pub fn stats(&self) -> DnsPoolStats {
-        let stats = self.stats.lock().unwrap();
-        (*stats).clone()
+        let active = self.active_queries.load(Ordering::Relaxed);
+        self.atomic_stats.snapshot(active, self.resolvers.len())
     }
 
     /// Get the current configuration
@@ -322,16 +345,9 @@ impl DnsResolverPool {
         self.resolvers.len()
     }
 
-    /// Check if the pool has any healthy resolvers
+    /// Check if the pool has any healthy resolvers (lock-free)
     pub fn has_healthy_resolvers(&self) -> bool {
-        let health_status = self.health_status.lock().unwrap();
-        health_status.iter().any(|h| h.is_healthy)
-    }
-
-    /// Get detailed health information for all resolvers
-    pub fn resolver_health(&self) -> Vec<ResolverHealth> {
-        let health_status = self.health_status.lock().unwrap();
-        health_status.clone()
+        self.health_flags.iter().any(|f| f.load(Ordering::Relaxed))
     }
 }
 
@@ -385,7 +401,7 @@ mod tests {
         stats.cache_hits = 60;
         stats.cache_misses = 40;
 
-        assert_eq!(stats.success_rate(), 80.0);
-        assert_eq!(stats.cache_hit_rate(), 60.0);
+        assert!((stats.success_rate() - 80.0).abs() < 0.01);
+        assert!((stats.cache_hit_rate() - 60.0).abs() < 0.01);
     }
 }

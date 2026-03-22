@@ -27,8 +27,10 @@ mod dns_pool;       // Temporarily restored for backward compatibility
 mod client_context;
 pub mod udp_tunnel_frame;  // UDP-over-TCP tunnel framing protocol
 
+use crate::dns_resolver::{DnsResolverConfig, InternalDnsResolver, DnsProtocol};
+use crate::dns_protocols::DnsError;
+use crate::dns_proxy::{DnsProxy, DnsProxyConfig};
 use dashmap::DashMap;
-use hickory_resolver::TokioAsyncResolver;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OwnedSemaphorePermit;
@@ -38,6 +40,7 @@ use crate::router::load_config;
 use crate::proxy::handle_tcp_stream;
 use crate::rule::{RuleEngine, RuleEngineConfig};
 use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use std::net::IpAddr;
 
 static ACCEPTED_CONNS_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ZERO_TRAFFIC_STREAK: AtomicU32 = AtomicU32::new(0);
@@ -94,12 +97,6 @@ const SOCKS5_IPV4_ATYP: u8 = 1;
 const SOCKS5_DOMAIN_ATYP: u8 = 3;
 const SOCKS5_FRAGMENT_ZERO: u8 = 0;
 
-// Get DNS resolver from the pool (temporarily using old dns_pool for backward compatibility)
-async fn get_resolver() -> Arc<TokioAsyncResolver> {
-    use crate::dns_pool::DNS_POOL;
-    DNS_POOL.get_resolver().await
-}
-
 /// DNS cache entry with metadata
 #[derive(Clone)]
 struct DnsCacheEntry {
@@ -114,7 +111,7 @@ struct DnsCacheEntry {
 type DnsCache = Arc<DashMap<String, DnsCacheEntry>>;
 
 /// Domain cache for UDP relay (IP->Domain mapping)
-type DomainCache = Arc<DashMap<std::net::IpAddr, (String, Instant)>>;
+type DomainCache = Arc<DashMap<IpAddr, (String, Instant)>>;
 
 /// Application configuration structure
 #[derive(Debug, Clone)]
@@ -140,25 +137,14 @@ type SharedRuleEngine = Arc<ArcSwap<RuleEngine>>;
 /// Custom error types for better error handling
 #[derive(Debug, Error)]
 pub enum ProxyError {
-    #[error("Configuration error: {0}")]
+    #[error("SOCKS5 error: {0}")]
+    Socks5(String),
+    #[error("Config error: {0}")]
     Config(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("TOML parsing error: {0}")]
     Toml(#[from] toml::de::Error),
-    #[error("DNS resolution error: {0}")]
-    Dns(#[from] hickory_resolver::error::ResolveError),
-    #[error("Network error: {0}")]
-    Network(#[from] std::io::Error),
-    #[error("SOCKS5 protocol error: {0}")]
-    Socks5(String),
-    #[error("Domain resolution error: {0}")]
-    DomainResolution(String),
-    #[error("Router configuration error: {0}")]
-    Router(String),
-}
-
-/// SOCKS5 specific errors
-#[derive(Debug, Error)]
-pub enum Socks5Error {
     #[error("Only SOCKS5 supported, got version: {0}")]
     UnsupportedVersion(u8),
     #[error("No authentication method supported")]
@@ -167,44 +153,46 @@ pub enum Socks5Error {
     UnsupportedCommand(u8),
     #[error("Unsupported address type: {0}")]
     UnsupportedAddressType(u8),
-    #[error("Domain resolution failed: {0}")]
-    DomainResolution(#[from] hickory_resolver::error::ResolveError),
     #[error("No IP found for domain")]
     NoIpForDomain,
+    #[error("DNS resolution failed: {0}")]
+    DnsError(#[from] DnsError),
+    #[error("Router configuration error: {0}")]
+    Router(String),
+    #[error("Domain resolution error: {0}")]
+    DomainResolution(String),
 }
+
 
 /// Attempt to resolve an IP address back to a domain name using reverse DNS lookup
 /// and fall back to forward DNS lookup against known domains if necessary
-async fn resolve_domain_from_ip(ip: std::net::IpAddr, rules: &RuleEngine, dns_cache: &DnsCache) -> anyhow::Result<String> {
+async fn resolve_domain_from_ip(
+    ip: std::net::IpAddr,
+    rules: &RuleEngine,
+    dns_cache: &DnsCache,
+    resolver: Arc<InternalDnsResolver>,
+) -> anyhow::Result<String> {
     use std::time::Instant;
     let start_time = Instant::now();
 
-    // FIX: Use DNS pool instead of creating a new resolver each time
-    // This prevents UDP socket leaks from creating multiple resolvers
-    let resolver = get_resolver().await;
-
     // Try reverse DNS first with timeout
-    match tokio::time::timeout(Duration::from_millis(200), resolver.reverse_lookup(ip)).await {
-        Ok(Ok(ptr_lookup)) => {
-            if let Some(record) = ptr_lookup.iter().next() {
-                let domain = record.to_utf8().trim_end_matches('.').to_string();
-                debug!("Reverse DNS resolved IP {} to domain: {} ({}ms)",
-                      ip, domain, start_time.elapsed().as_millis());
+    match tokio::time::timeout(Duration::from_millis(200), resolver.reverse_resolve(ip)).await {
+        Ok(Ok(domain)) => {
+            let domain = domain.trim_end_matches('.').to_string();
+            debug!("Reverse DNS resolved IP {} to domain: {} ({}ms)",
+                  ip, domain, start_time.elapsed().as_millis());
 
-                // Check if the resolved domain matches any rule
-                if rules.get_routing_decision(&domain).is_some() {
-                    return Ok(domain);
-                }
-                debug!("Reverse DNS domain {} does not match any rules", domain);
-            } else {
-                debug!("No PTR record found for IP: {}", ip);
+            // Check if the resolved domain matches any rule
+            if rules.get_routing_decision(&domain).is_some() {
+                return Ok(domain);
             }
+            debug!("Reverse DNS domain {} does not match any rules", domain);
         }
         Ok(Err(e)) => {
-            debug!("Reverse DNS lookup failed for IP {}: {}", ip, e);
+            debug!("Reverse DNS lookup for IP {} failed: {}", ip, e);
         }
         Err(_) => {
-            debug!("Reverse DNS lookup timed out for IP {}", ip);
+            debug!("Reverse DNS lookup for IP {} timed out", ip);
         }
     }
 
@@ -234,9 +222,10 @@ async fn resolve_domain_from_ip(ip: std::net::IpAddr, rules: &RuleEngine, dns_ca
                 }
             }
 
-            match tokio::time::timeout(Duration::from_millis(100), resolver_clone.lookup_ip(rule_domain.clone())).await {
+            // Ретри за доменным именем для логирования/правил (на горячем пути)
+            match tokio::time::timeout(Duration::from_millis(100), resolver_clone.resolve_first(&rule_domain)).await {
                 Ok(Ok(response)) => {
-                    if response.iter().any(|addr| addr == ip) {
+                    if response == ip {
                         dns_cache_clone.insert(rule_domain.clone(), DnsCacheEntry {
                             ip: Some(ip),
                             timestamp: Instant::now(),
@@ -298,7 +287,8 @@ async fn run_socks5_udp_handler(
     rule_engine: RuleEngine,
     config: Arc<udp_proxy::Config>,
     domain_cache: DomainCache,
-    upstream_proxy_timeout: Duration
+    upstream_proxy_timeout: Duration,
+    resolver: Arc<InternalDnsResolver>,
 ) -> Result<(), ProxyError> {
     let socket = Arc::new(socket);
     let sessions: Arc<DashMap<SessionKey, Arc<UdpSession>>> = Arc::new(DashMap::new());
@@ -326,6 +316,7 @@ async fn run_socks5_udp_handler(
                     upstream_proxy_timeout,
                     transparent_sender.clone(),
                     &udp_semaphore,
+                    resolver.clone(),
                 ).await {
                     debug!("Error processing UDP packet from {}: {}", client_addr, e);
                 }
@@ -349,12 +340,13 @@ async fn process_udp_packet(
     timeout: Duration,
     transparent_sender: Arc<udp_proxy::TransparentUdpSender>,
     udp_semaphore: &Arc<tokio::sync::Semaphore>,
+    resolver: Arc<InternalDnsResolver>,
 ) -> Result<(), ProxyError> {
     // Validate packet size and SOCKS5 header
     validate_socks5_udp_packet(packet, size)?;
 
     let atype = packet[3];
-    let (target_addr, payload_start) = parse_udp_target_address(packet, size, atype).await?;
+    let (target_addr, payload_start) = parse_udp_target_address(packet, size, atype, resolver).await?;
 
     let payload = packet[payload_start..size].to_vec();
 
@@ -416,7 +408,8 @@ fn validate_socks5_udp_packet(packet: &[u8], size: usize) -> Result<(), ProxyErr
 async fn parse_udp_target_address(
     packet: &[u8],
     size: usize,
-    atyp: u8
+    atyp: u8,
+    resolver: Arc<InternalDnsResolver>,
 ) -> Result<(SocketAddr, usize), ProxyError> {
     match atyp {
         SOCKS5_IPV4_ATYP => {
@@ -442,12 +435,8 @@ async fn parse_udp_target_address(
             let domain = String::from_utf8_lossy(&packet[5..domain_end]);
             let port = u16::from_be_bytes([packet[domain_end], packet[domain_end + 1]]);
 
-            let resolver = get_resolver().await;
-            let response = resolver.lookup_ip(domain.to_string()).await
-                .map_err(|_| ProxyError::Socks5("Domain resolution failed".to_string()))?;
-
-            let ip = response.iter().next()
-                .ok_or_else(|| ProxyError::Socks5("No IP found for domain".to_string()))?;
+            let ip = resolver.resolve_first(&domain).await
+                .map_err(|e| ProxyError::Socks5(format!("Domain resolution failed: {}", e)))?;
 
             Ok((SocketAddr::new(ip, port), domain_end + 2))
         }
@@ -460,7 +449,7 @@ async fn reload_router_config_with_static_geodata(
     rule_engine_config: &RuleEngineConfig,
     geoip_countries: Arc<std::collections::HashMap<String, Vec<crate::rule::CidrBlock>>>,
     geosite_categories: Arc<std::collections::HashMap<String, crate::rule::OptimizedGeoSite>>,
-    resolver: Arc<TokioAsyncResolver>,
+    resolver: Arc<InternalDnsResolver>,
 ) -> anyhow::Result<RuleEngine> {
     info!("Reloading router configuration from router.json (preserving GeoIP/GeoSite databases in memory)");
     let router = load_config("router.json").await?;
@@ -475,20 +464,16 @@ async fn reload_router_config_with_static_geodata(
     Ok(rule_engine)
 }
 
-/// Legacy reload function (kept for reference, not used)
-#[allow(dead_code)]
-async fn reload_router_config(rule_engine_config: &RuleEngineConfig) -> anyhow::Result<RuleEngine> {
-    info!("Reloading router configuration from router.json");
+/// Reload function kept for reference
+async fn reload_router_config(_rule_engine_config: &RuleEngineConfig, _resolver: Arc<InternalDnsResolver>) -> anyhow::Result<RuleEngine> {
     let router = load_config("router.json").await?;
-    let rule_engine = RuleEngine::from_config_with_options(router, rule_engine_config.clone())?;
-    info!("Router configuration reloaded successfully");
-    Ok(rule_engine)
+    RuleEngine::from_config(router, _resolver)
 }
 
 /// Establish UDP associate with upstream proxy
 async fn establish_udp_associate(proxy: &crate::router::Proxy, timeout: Duration) -> Result<SocketAddr, ProxyError> {
     let mut stream = TcpStream::connect((proxy.server_addr.as_str(), proxy.server_port)).await
-        .map_err(|e| ProxyError::Network(e))?;
+        .map_err(ProxyError::Io)?;
 
     // SOCKS5 greeting
     let auth_methods = if proxy.auth.username.is_empty() && proxy.auth.pass.is_empty() {
@@ -797,10 +782,8 @@ async fn main() -> anyhow::Result<()> {
     println!("Cheburproxy client v1.0");
 
     // ============ DNS Leak Prevention: Initialize DNS Proxy ============
-    {
-        use crate::dns_resolver::{DnsResolverConfig, InternalDnsResolver, DnsProtocol};
-        use crate::dns_proxy::{DnsProxy, DnsProxyConfig};
-
+    // Parse DNS configuration and initialize resolver
+    let shared_dns_resolver = {
         // Parse DNS resolver protocol from config
         let dns_resolver_protocol_str = parsed.get("client")
             .and_then(|c| c.get("dns_resolver_protocol"))
@@ -877,6 +860,21 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // Initialize the Core DNS Resolver (used by both DNS Proxy and Rule Engine)
+        let dns_resolver = match InternalDnsResolver::from_config(dns_config).await {
+            Ok(resolver) => {
+                let resolver = Arc::new(resolver);
+                info!("Core DNS Resolver initialized (protocol={})", resolver.protocol_name());
+                resolver
+            }
+            Err(e) => {
+                error!("CRITICAL: Failed to initialize Core DNS Resolver: {}. Application may function incorrectly.", e);
+                // Fallback to a plain resolver if possible, or exit
+                // For now, we'll try to continue but rule-based DNS and DNS Proxy will fail
+                return Err(anyhow::anyhow!("Failed to initialize DNS resolver: {}", e));
+            }
+        };
+
         if dns_proxy_enabled {
             let dns_proxy_listen = parsed.get("client")
                 .and_then(|c| c.get("dns_proxy_listen"))
@@ -901,38 +899,30 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            info!("Starting DNS Proxy (protocol={}, listen={}:{})...",
-                  dns_resolver_protocol_str, dns_proxy_listen, dns_proxy_port);
+            info!("Starting DNS Proxy (listen={}:{})...", dns_proxy_listen, dns_proxy_port);
 
-            match InternalDnsResolver::from_config(dns_config).await {
-                Ok(resolver) => {
-                    let resolver = Arc::new(resolver);
-                    info!("Internal DNS Resolver initialized (protocol={})", resolver.protocol_name());
+            let proxy_config = DnsProxyConfig {
+                enabled: true,
+                listen_addr: dns_proxy_listen,
+                listen_port: dns_proxy_port,
+                cache_size_limit: 10000,
+                cache_ttl: dns_proxy_cache_ttl,
+                log_queries: dns_proxy_log_queries,
+            };
 
-                    let proxy_config = DnsProxyConfig {
-                        enabled: true,
-                        listen_addr: dns_proxy_listen,
-                        listen_port: dns_proxy_port,
-                        cache_size_limit: 10000,
-                        cache_ttl: dns_proxy_cache_ttl,
-                        log_queries: dns_proxy_log_queries,
-                    };
-
-                    let dns_proxy = Arc::new(DnsProxy::new(proxy_config, resolver));
-                    tokio::spawn(async move {
-                        if let Err(e) = dns_proxy.start().await {
-                            error!("DNS Proxy failed: {}", e);
-                        }
-                    });
+            let dns_proxy = Arc::new(DnsProxy::new(proxy_config, dns_resolver.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = dns_proxy.start().await {
+                    error!("DNS Proxy failed: {}", e);
                 }
-                Err(e) => {
-                    error!("Failed to initialize DNS resolver: {}. DNS Proxy will not start.", e);
-                }
-            }
+            });
         } else {
             debug!("DNS Proxy is disabled (dns_proxy_enabled = false)");
         }
-    }
+
+        // Shared resolver for RuleEngine
+        dns_resolver
+    };
 
     let router = load_config("router.json").await?;
     
@@ -1022,7 +1012,7 @@ async fn main() -> anyhow::Result<()> {
         availability_cache_ttl,
     };
     // Create shared state for hot-reload
-    let initial_rule_engine = RuleEngine::from_config_with_options(router.clone(), rule_config.clone())?;
+    let initial_rule_engine = RuleEngine::from_config_with_resolver(router.clone(), rule_config.clone(), shared_dns_resolver.clone())?;
     
     // Extract static GeoIP/GeoSite data for memory-efficient hot-reloads
     let (geoip_countries, geosite_categories, resolver) = initial_rule_engine.extract_static_geodata();
@@ -1269,9 +1259,10 @@ async fn main() -> anyhow::Result<()> {
             let udp_shared_state = shared_state.clone();
             let domain_cache_for_udp = domain_cache.clone();
             let _udp_relay = udp_relay_addr;
+            let udp_resolver = shared_dns_resolver.clone();
             tokio::spawn(async move {
                 let udp_rules = (**udp_shared_state.load()).clone();
-                if let Err(e) = run_udp_proxy(udp_rules, udp_config, domain_cache_for_udp, upstream_proxy_timeout).await {
+                if let Err(e) = run_udp_proxy(udp_rules, udp_config, domain_cache_for_udp, upstream_proxy_timeout, udp_resolver).await {
                     error!("Failed to start UDP proxy: {}", e);
                 }
             });
@@ -1345,6 +1336,7 @@ async fn main() -> anyhow::Result<()> {
                 let engine: RuleEngine = (**shared_state.load()).clone();
                 let cache = dns_cache.clone();
                 let domain_cache = domain_cache.clone();
+                let resolver = shared_dns_resolver.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // hold permit for lifetime of connection
                     let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
@@ -1391,7 +1383,7 @@ async fn main() -> anyhow::Result<()> {
                             let optional_domain = if !use_reverse_dns {
                                 sni_domain
                             } else {
-                                match resolve_domain_from_ip(dst.ip(), &engine, &cache).await {
+                                match resolve_domain_from_ip(dst.ip(), &engine, &cache, resolver).await {
                                     Ok(domain) => {
                                         info!("Reverse DNS resolved {} to {}", dst.ip(), domain);
 
@@ -1457,14 +1449,18 @@ async fn main() -> anyhow::Result<()> {
             let upstream_timeout_clone = upstream_proxy_timeout;
             let udp_config_clone = udp_config.clone();
             let domain_cache_clone = domain_cache.clone();
+            let udp_resolver = shared_dns_resolver.clone();
             tokio::spawn(async move {
                 let udp_rules = (**udp_handler_shared_state.load()).clone();
-                run_socks5_udp_handler(udp_socket, udp_rules, udp_config_clone, domain_cache_clone, upstream_timeout_clone).await;
+                if let Err(e) = run_socks5_udp_handler(udp_socket, udp_rules, udp_config_clone, domain_cache_clone, upstream_timeout_clone, udp_resolver).await {
+                    error!("UDP handler failed: {}", e);
+                }
             });
             let udp_proxy_shared_state = shared_state.clone();
+            let udp_resolver_for_run_udp_proxy = shared_dns_resolver.clone();
             tokio::spawn(async move {
                 let udp_rules = (**udp_proxy_shared_state.load()).clone();
-                if let Err(e) = run_udp_proxy(udp_rules, udp_config, domain_cache, upstream_proxy_timeout).await {
+                if let Err(e) = run_udp_proxy(udp_rules, udp_config, domain_cache, upstream_proxy_timeout, udp_resolver_for_run_udp_proxy).await {
                     error!("Failed to start UDP proxy: {}", e);
                 }
             });

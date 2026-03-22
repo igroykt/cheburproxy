@@ -146,11 +146,25 @@ impl CachedDnsEntry {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CachedReverseEntry {
+    domain: String,
+    timestamp: Instant,
+    ttl: Duration,
+}
+
+impl CachedReverseEntry {
+    fn is_expired(&self) -> bool {
+        self.timestamp.elapsed() >= self.ttl
+    }
+}
+
 /// Internal DNS Resolver
 pub struct InternalDnsResolver {
     config: Arc<DnsResolverConfig>,
     handler: Arc<dyn DnsProtocolHandler>,
     cache: DashMap<String, CachedDnsEntry>,
+    reverse_cache: DashMap<IpAddr, CachedReverseEntry>,
     bootstrap: Option<Arc<BootstrapResolver>>,
 }
 
@@ -318,6 +332,7 @@ impl InternalDnsResolver {
             config: Arc::new(config),
             handler,
             cache: DashMap::new(),
+            reverse_cache: DashMap::new(),
             bootstrap,
         })
     }
@@ -336,25 +351,50 @@ impl InternalDnsResolver {
         debug!("Internal DNS Resolver: querying {} using {} protocol",
             domain, self.handler.protocol_name());
         
-        let ips = self.handler.query(domain).await?;
-        
-        // Cache the result — clamp configured TTL to [60, 3600] seconds so we never
-        // cache for less than a minute (excessive re-queries) or more than an hour.
-        // Per-record TTL from the DNS wire response is not available here because
-        // handler.query() only returns IP addresses; full TTL extraction would require
-        // switching to handler.query_raw() with manual response parsing.
-        let cache_duration = Duration::from_secs(
-            self.config.cache_ttl.max(60).min(3600)
-        );
-        self.cache.insert(domain.to_string(), CachedDnsEntry {
-            ips: ips.clone(),
-            timestamp: Instant::now(),
-            ttl: cache_duration,
-        });
-        
-        debug!("Internal DNS Resolver: resolved {} to {:?}", domain, ips);
-        
-        Ok(ips)
+        match self.handler.query(domain).await {
+            Ok(ips) => {
+                // Cache the result
+                let cache_duration = Duration::from_secs(self.config.cache_ttl.max(60).min(3600));
+                self.cache.insert(domain.to_string(), CachedDnsEntry {
+                    ips: ips.clone(),
+                    timestamp: Instant::now(),
+                    ttl: cache_duration,
+                });
+                debug!("Internal DNS Resolver: resolved {} to {:?}", domain, ips);
+                Ok(ips)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolve an IP address to a domain name (Reverse DNS)
+    pub async fn reverse_resolve(&self, ip: IpAddr) -> DnsResult<String> {
+        // Check cache first
+        if let Some(entry) = self.reverse_cache.get(&ip) {
+            if !entry.is_expired() {
+                debug!("Internal DNS Resolver: reverse cache hit for {}", ip);
+                return Ok(entry.domain.clone());
+            }
+        }
+
+        // Query using protocol handler
+        debug!("Internal DNS Resolver: reverse querying {} using {} protocol",
+            ip, self.handler.protocol_name());
+
+        match self.handler.reverse_query(ip).await {
+            Ok(domain) => {
+                // Cache the result
+                let cache_duration = Duration::from_secs(self.config.cache_ttl.max(60).min(3600));
+                self.reverse_cache.insert(ip, CachedReverseEntry {
+                    domain: domain.clone(),
+                    timestamp: Instant::now(),
+                    ttl: cache_duration,
+                });
+                debug!("Internal DNS Resolver: reverse resolved {} to {}", ip, domain);
+                Ok(domain)
+            }
+            Err(e) => Err(e),
+        }
     }
     
     /// Forward a raw DNS query through the configured protocol handler

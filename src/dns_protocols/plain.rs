@@ -105,6 +105,27 @@ impl PlainDnsHandler {
         Ok(ips)
     }
     
+    /// Parse DNS response and extract domain name for PTR record
+    fn parse_reverse_response(response: &[u8]) -> DnsResult<String> {
+        let message = Message::from_bytes(response)
+            .map_err(|e| DnsError::InvalidResponse(format!("Failed to parse DNS response: {}", e)))?;
+        
+        use hickory_proto::op::ResponseCode;
+        if message.response_code() != ResponseCode::NoError {
+            return Err(DnsError::QueryFailed(
+                format!("DNS query failed with response code: {:?}", message.response_code())
+            ));
+        }
+        
+        for answer in message.answers() {
+            if let Some(hickory_proto::rr::RData::PTR(name)) = answer.data() {
+                return Ok(name.to_utf8().trim_end_matches('.').to_string());
+            }
+        }
+        
+        Err(DnsError::QueryFailed("No PTR record found in response".to_string()))
+    }
+    
     /// Query a single DNS server via UDP with concurrent A+AAAA queries (Happy Eyeballs)
     async fn query_server(&self, server: &SocketAddr, domain: &str) -> DnsResult<Vec<IpAddr>> {
         // Build both A and AAAA queries
@@ -313,6 +334,26 @@ impl DnsProtocolHandler for PlainDnsHandler {
         }
         
         Err(last_error.unwrap_or_else(|| DnsError::QueryFailed("All DNS servers failed for raw query".to_string())))
+    }
+
+    async fn reverse_query(&self, ip: IpAddr) -> DnsResult<String> {
+        let ptr_name = match ip {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                format!("{}.{}.{}.{}.in-addr.arpa.", octets[3], octets[2], octets[1], octets[0])
+            }
+            IpAddr::V6(v6) => {
+                let mut nibbles = String::new();
+                for &octet in v6.octets().iter().rev() {
+                    nibbles.push_str(&format!("{:x}.{:x}.", octet & 0xf, octet >> 4));
+                }
+                format!("{}ip6.arpa.", nibbles)
+            }
+        };
+        let query_bytes = Self::build_query(&ptr_name, RecordType::PTR)?;
+        
+        let response_bytes = self.query_raw(&query_bytes).await?;
+        Self::parse_reverse_response(&response_bytes)
     }
     
     fn protocol_name(&self) -> &'static str {
