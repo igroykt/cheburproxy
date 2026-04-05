@@ -12,7 +12,7 @@ use hickory_proto::{
     serialize::binary::{BinDecodable, BinEncodable},
 };
 use log::{debug, warn};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 /// DoH server configuration
@@ -67,6 +67,98 @@ pub struct DohHandler {
     client: reqwest::Client,
 }
 
+/// Normalize a SOCKS5 proxy URL for use with DoH:
+///
+/// 1. Forces `socks5://` → `socks5h://` so that DNS resolution of the DoH
+///    server hostname is performed by the SOCKS5 proxy, not locally.
+///    Using `socks5://` causes reqwest to call `getaddrinfo()` locally before
+///    tunnelling; if the system DNS points back at cheburproxy this creates an
+///    infinite DNS resolution loop and every query times out.
+///
+/// 2. Encloses bare (unbracketed) IPv6 addresses in square brackets per
+///    RFC 3986, so the URL can be parsed correctly by reqwest / the `url` crate.
+///
+/// Examples:
+///   "socks5://20d:9cf7:cd19:5a82:af8b:f1be:f538:3d59:1080"
+///     -> "socks5h://[20d:9cf7:cd19:5a82:af8b:f1be:f538:3d59]:1080"
+///   "socks5://127.0.0.1:1080"  ->  "socks5h://127.0.0.1:1080"
+///   "socks5://[::1]:1080"      ->  "socks5h://[::1]:1080"
+///   "socks5h://[::1]:1080"     ->  unchanged
+fn normalize_proxy_url(url: &str) -> String {
+    // Find scheme end (e.g., "socks5://")
+    let scheme_end = match url.find("://") {
+        Some(pos) => pos + 3,
+        None => return url.to_string(),
+    };
+    let scheme_str = &url[..scheme_end - 3]; // e.g. "socks5" or "socks5h"
+    let rest = &url[scheme_end..];
+
+    // Step 1: normalize scheme — always use socks5h:// so the SOCKS5 proxy
+    // handles DNS resolution of the DoH server hostname, avoiding DNS loops.
+    let target_scheme = match scheme_str {
+        "socks5" => {
+            warn!(
+                "DoH: converting socks5:// to socks5h:// so the proxy resolves DoH server \
+                 hostnames — this prevents a DNS resolution loop when the system resolver \
+                 points back at cheburproxy"
+            );
+            "socks5h"
+        }
+        other => other,
+    };
+
+    // Separate optional "user:pass@" auth prefix from host:port
+    let (auth_prefix, host_port) = match rest.rfind('@') {
+        Some(at) => (&rest[..=at], &rest[at + 1..]),
+        None => ("", rest),
+    };
+
+    // Step 2: normalize IPv6 brackets.
+    // If the host is already bracketed, just rebuild with the correct scheme.
+    if host_port.starts_with('[') {
+        if target_scheme == scheme_str {
+            return url.to_string();
+        }
+        return format!("{}://{}{}", target_scheme, auth_prefix, host_port);
+    }
+
+    // Count colons in host_port; more than one means it's likely a bare IPv6.
+    let colon_count = host_port.chars().filter(|&c| c == ':').count();
+    if colon_count <= 1 {
+        // IPv4 or hostname — only scheme normalisation needed.
+        if target_scheme == scheme_str {
+            return url.to_string();
+        }
+        return format!("{}://{}{}", target_scheme, auth_prefix, host_port);
+    }
+
+    // Try to split off the last segment as a port number.
+    if let Some(last_colon) = host_port.rfind(':') {
+        let candidate_addr = &host_port[..last_colon];
+        let candidate_port = &host_port[last_colon + 1..];
+
+        // Validate: candidate_port must be a u16, candidate_addr must be IPv6.
+        if candidate_port.parse::<u16>().is_ok()
+            && candidate_addr.parse::<Ipv6Addr>().is_ok()
+        {
+            let normalized = format!(
+                "{}://{}[{}]:{}",
+                target_scheme, auth_prefix, candidate_addr, candidate_port
+            );
+            debug!("DoH: normalized proxy URL: '{}' -> '{}'", url, normalized);
+            return normalized;
+        }
+    }
+
+    // Could not normalize IPv6 — apply scheme fix only and let reqwest report
+    // any remaining parse error.
+    if target_scheme == scheme_str {
+        url.to_string()
+    } else {
+        format!("{}://{}{}", target_scheme, auth_prefix, host_port)
+    }
+}
+
 impl DohHandler {
     /// Create a new DoH handler
     pub fn new(config: DohConfig) -> DnsResult<Self> {
@@ -85,10 +177,11 @@ impl DohHandler {
         // Configure SOCKS5 proxy if needed
         if config.use_socks5 {
             if let Some(proxy_url) = &config.socks5_proxy {
-                let proxy = reqwest::Proxy::all(proxy_url)
+                let normalized_url = normalize_proxy_url(proxy_url);
+                let proxy = reqwest::Proxy::all(normalized_url.as_str())
                     .map_err(|e| DnsError::Socks5Error(format!("Invalid SOCKS5 proxy URL: {}", e)))?;
                 client_builder = client_builder.proxy(proxy);
-                debug!("DoH: configured to use SOCKS5 proxy at {}", proxy_url);
+                debug!("DoH: configured to use SOCKS5 proxy at {}", normalized_url);
             } else {
                 return Err(DnsError::Socks5Error(
                     "use_socks5 enabled but no socks5_proxy configured".to_string()
