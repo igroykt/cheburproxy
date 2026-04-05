@@ -76,7 +76,7 @@ pub fn extract_sni(data: &[u8]) -> Result<Option<String>, SniError> {
     let mut parser = TlsParser::new(data);
     match parser.parse_client_hello()? {
         Some(()) => parser.parse_extensions(), // Continue to parse extensions
-        None => Ok(None), // Not a ClientHello or incomplete data
+        None => Ok(None),                      // Not a ClientHello or incomplete data
     }
 }
 
@@ -165,11 +165,9 @@ impl<'a> TlsParser<'a> {
     fn parse_extensions(&mut self) -> Result<Option<String>, SniError> {
         // Read extensions length
         let extensions_len = self.read_u16_be()? as usize;
-        let extensions_end = self.position + extensions_len;
-
-        if self.position + extensions_len > self.data.len() {
-            return Err(SniError::InvalidExtensionData);
-        }
+        // Clamp extensions_end to available data length — peek() may return
+        // a truncated ClientHello, but SNI is typically among the first extensions.
+        let extensions_end = std::cmp::min(self.position + extensions_len, self.data.len());
 
         // Parse each extension
         while self.position + 4 <= extensions_end {
@@ -255,40 +253,41 @@ mod tests {
         // This is carefully crafted to be exactly correct
         let tls_data = &[
             0x16, 0x03, 0x01, 0x00, 0x5f, // TLS record header (95 bytes total)
-            0x01, 0x00, 0x00, 0x5b,       // Handshake header (91 bytes)
-            0x03, 0x03,                   // TLS version 1.2
+            0x01, 0x00, 0x00, 0x5b, // Handshake header (91 bytes)
+            0x03, 0x03, // TLS version 1.2
             // Random (32 bytes) - using zeros for simplicity
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,                         // Session ID length (0)
-            0x00, 0x04,                   // Cipher suites length (4 bytes)
-            0xc0, 0x13, 0x00, 0x39,       // Two cipher suites
-            0x01,                         // Compression length (1)
-            0x00,                         // No compression
-            0x00, 0x1a,                   // Extensions length (26 bytes)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, // Session ID length (0)
+            0x00, 0x04, // Cipher suites length (4 bytes)
+            0xc0, 0x13, 0x00, 0x39, // Two cipher suites
+            0x01, // Compression length (1)
+            0x00, // No compression
+            0x00, 0x1a, // Extensions length (26 bytes)
             // Extension: server_name
-            0x00, 0x00,                   // Extension type: server_name (0)
-            0x00, 0x0e,                   // Extension length (14 bytes)
-            0x00, 0x0c,                   // Server name list length (12 bytes)
-            0x00,                         // Name type: hostname (0)
-            0x00, 0x09,                   // Name length (9 bytes)
-            0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, // "example.com" (but length says 9, so it will be "example.c")
+            0x00, 0x00, // Extension type: server_name (0)
+            0x00, 0x0e, // Extension length (14 bytes)
+            0x00, 0x0c, // Server name list length (12 bytes)
+            0x00, // Name type: hostname (0)
+            0x00, 0x09, // Name length (9 bytes)
+            0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f,
+            0x6d, // "example.com" (but length says 9, so it will be "example.c")
             // Extension: ec_point_formats (minimal)
-            0x00, 0x0b,                   // Extension type: ec_point_formats (11)
-            0x00, 0x04,                   // Extension length (4 bytes)
-            0x00, 0x02,                   // EC point formats length (2 bytes)
-            0x01, 0x00,                   // Uncompressed (1), (0)
+            0x00, 0x0b, // Extension type: ec_point_formats (11)
+            0x00, 0x04, // Extension length (4 bytes)
+            0x00, 0x02, // EC point formats length (2 bytes)
+            0x01, 0x00, // Uncompressed (1), (0)
             // Extension: signature_algorithms (minimal)
-            0x00, 0x0d,                   // Extension type: signature_algorithms (13)
-            0x00, 0x02,                   // Extension length (2 bytes)
-            0x00, 0x00,                   // Signature algorithms length (0 bytes) - minimal but valid
+            0x00, 0x0d, // Extension type: signature_algorithms (13)
+            0x00, 0x02, // Extension length (2 bytes)
+            0x00, 0x00, // Signature algorithms length (0 bytes) - minimal but valid
         ];
 
         match extract_sni(tls_data) {
             Ok(Some(name)) => {
                 // The name length in the test data is 9, so we get "example.c"
                 assert_eq!(name, "example.c");
-            },
+            }
             Ok(None) => panic!("Expected SNI but got None"),
             Err(e) => panic!("Unexpected error: {}", e),
         }
@@ -299,21 +298,21 @@ mod tests {
         // Test with TLS data that has no SNI extension (properly sized)
         let tls_data = &[
             0x16, 0x03, 0x01, 0x00, 0x4f, // TLS record header (79 bytes total)
-            0x01, 0x00, 0x00, 0x4b,       // Handshake header (75 bytes)
-            0x03, 0x03,                   // TLS version 1.2
+            0x01, 0x00, 0x00, 0x4b, // Handshake header (75 bytes)
+            0x03, 0x03, // TLS version 1.2
             // Random (32 bytes)
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-            0x00,                         // Session ID length (0)
-            0x00, 0x04,                   // Cipher suites length (4 bytes)
-            0xc0, 0x13, 0x00, 0x39,       // Cipher suites
-            0x01,                         // Compression length (1)
-            0x00,                         // No compression
-            0x00, 0x00,                   // No extensions (0 bytes)
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f, 0x00, // Session ID length (0)
+            0x00, 0x04, // Cipher suites length (4 bytes)
+            0xc0, 0x13, 0x00, 0x39, // Cipher suites
+            0x01, // Compression length (1)
+            0x00, // No compression
+            0x00, 0x00, // No extensions (0 bytes)
         ];
 
         match extract_sni(tls_data) {
-            Ok(None) => {}, // Expected - no SNI extension present
+            Ok(None) => {} // Expected - no SNI extension present
             Ok(Some(name)) => panic!("Unexpected SNI found: {}", name),
             Err(e) => panic!("Unexpected error: {}", e),
         }
@@ -333,9 +332,9 @@ mod tests {
         // Test with data that looks like TLS but is malformed
         let malformed_tls = &[0x16, 0x03, 0x01, 0x00, 0x10, 0x01]; // Too short for proper TLS
         match extract_sni(malformed_tls) {
-            Ok(None) => {}, // Expected for some malformed cases
+            Ok(None) => {} // Expected for some malformed cases
             Ok(Some(_)) => panic!("Unexpected SNI extracted from malformed data"),
-            Err(SniError::DataTooShort) => {}, // Also acceptable for malformed data
+            Err(SniError::DataTooShort) => {} // Also acceptable for malformed data
             Err(e) => panic!("Unexpected error type: {}", e),
         }
     }

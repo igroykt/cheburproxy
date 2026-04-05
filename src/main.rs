@@ -23,7 +23,6 @@ mod sni;
 mod dns_protocols;  // NEW: DNS protocol handlers (Plain, DoT, DoH, SOCKS5)
 mod dns_resolver;   // NEW: Internal DNS resolver
 mod dns_proxy;      // NEW: DNS proxy server for LAN clients
-mod dns_pool;       // Temporarily restored for backward compatibility
 mod client_context;
 pub mod udp_tunnel_frame;  // UDP-over-TCP tunnel framing protocol
 
@@ -580,11 +579,24 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let listen = parsed.get("listen").and_then(|v| v.as_str()).unwrap_or("0.0.0.0");
-    let port = parsed.get("port").and_then(|v| v.as_integer()).map(|p| p as u16).unwrap_or(1080u16);
-    let mode = parsed.get("mode").and_then(|v| v.as_str()).unwrap_or("transparent");
-    let username = parsed.get("username").and_then(|v| v.as_str()).unwrap_or("");
-    let password = parsed.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    // Support [general] section (preferred) with fallback to top-level keys for backward compat.
+    let general = parsed.get("general");
+
+    let listen = general.and_then(|g| g.get("listen")).and_then(|v| v.as_str())
+        .or_else(|| parsed.get("listen").and_then(|v| v.as_str()))
+        .unwrap_or("0.0.0.0");
+    let port = general.and_then(|g| g.get("port")).and_then(|v| v.as_integer()).map(|p| p as u16)
+        .or_else(|| parsed.get("port").and_then(|v| v.as_integer()).map(|p| p as u16))
+        .unwrap_or(1080u16);
+    let mode = general.and_then(|g| g.get("mode")).and_then(|v| v.as_str())
+        .or_else(|| parsed.get("mode").and_then(|v| v.as_str()))
+        .unwrap_or("transparent");
+    let username = general.and_then(|g| g.get("username")).and_then(|v| v.as_str())
+        .or_else(|| parsed.get("username").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let password = general.and_then(|g| g.get("password")).and_then(|v| v.as_str())
+        .or_else(|| parsed.get("password").and_then(|v| v.as_str()))
+        .unwrap_or("");
 
     // Load upstream proxy timeout from [client] section (in seconds, default 10s)
     // This replaces the CHEBUR_PROXY_CONNECT_TIMEOUT_MS env var for all upstream connections
@@ -599,11 +611,14 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| p as u16)
         .unwrap_or(53u16);
 
+    // UDP defaults to TCP port + 1, so TCP and UDP can each be bound on all address families
+    // without a port conflict between the dual-stack TCP listener and the separate
+    // IPv4/IPv6 UDP sockets that the UDP proxy always creates.
     let udp_port = parsed.get("client")
         .and_then(|client| client.get("udp_port"))
         .and_then(|v| v.as_integer())
         .map(|p| p as u16)
-        .unwrap_or(port);
+        .unwrap_or(port + 1);
 
     let udp_desync_enabled = parsed.get("client")
         .and_then(|client| client.get("udp_desync_enabled"))
@@ -700,6 +715,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Circuit breaker configuration ────────────────────────────────────
     {
+        let cb_enabled = parsed.get("client")
+            .and_then(|c| c.get("circuit_breaker_enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         let cb_cooldown = parsed.get("client")
             .and_then(|c| c.get("circuit_breaker_cooldown"))
             .and_then(|v| v.as_integer())
@@ -710,7 +730,7 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|c| c.get("circuit_breaker_threshold"))
             .and_then(|v| v.as_integer())
             .map(|n| n as u32)
-            .unwrap_or(3);
+            .unwrap_or(5);
 
         let cb_probe_interval = parsed.get("client")
             .and_then(|c| c.get("circuit_breaker_probe_interval"))
@@ -731,6 +751,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(Duration::from_secs(300));
 
         let health_config = proxy_health::HealthConfig {
+            enabled: cb_enabled,
             cooldown: cb_cooldown,
             failure_threshold: cb_threshold,
             probe_interval: cb_probe_interval,
@@ -738,8 +759,14 @@ async fn main() -> anyhow::Result<()> {
             max_open_duration: cb_max_open,
         };
 
-        info!("Circuit breaker config: cooldown={}s, threshold={}, probe_interval={}s, probe_timeout={}s, max_open={}s",
-              cb_cooldown.as_secs(), cb_threshold, cb_probe_interval.as_secs(), cb_probe_timeout.as_secs(), cb_max_open.as_secs());
+        if cb_enabled {
+            info!("Circuit breaker config: enabled=true, cooldown={}s, threshold={}, \
+                   probe_interval={}s, probe_timeout={}s, max_open={}s",
+                  cb_cooldown.as_secs(), cb_threshold, cb_probe_interval.as_secs(),
+                  cb_probe_timeout.as_secs(), cb_max_open.as_secs());
+        } else {
+            info!("Circuit breaker config: enabled=false (fast-fail and health probes DISABLED)");
+        }
 
         proxy_health::init(health_config);
     }
@@ -1417,6 +1444,9 @@ async fn main() -> anyhow::Result<()> {
                                     crate::proxy::ProxyError::ConnectionTimeout { .. } => {
                                         warn!("Connection to {} timed out: {}", dst, e);
                                     }
+                                    crate::proxy::ProxyError::TargetUnreachable { target, reply_code } => {
+                                        debug!("Target {} unreachable (SOCKS5 reply {:#04x})", target, reply_code);
+                                    }
                                     _ => {
                                         error!("Error processing connection to {}: {:?}", dst, e);
                                     }
@@ -1507,9 +1537,10 @@ async fn main() -> anyhow::Result<()> {
                 };
                 // P0-1 FIX: Lock-free read via ArcSwap
                 let engine: RuleEngine = (**shared_state.load()).clone();
+                let resolver_for_socks5 = shared_dns_resolver.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // hold permit for lifetime of connection
-                    let (dst, domain) = match crate::proxy::handle_socks5_handshake(&mut stream).await {
+                    let (dst, domain) = match crate::proxy::handle_socks5_handshake(&mut stream, &resolver_for_socks5).await {
                         Ok(d) => d,
                         Err(e) => {
                             error!("SOCKS5 handshake failed: {e:?}");
@@ -1526,6 +1557,9 @@ async fn main() -> anyhow::Result<()> {
                             }
                             crate::proxy::ProxyError::ConnectionTimeout { .. } => {
                                 warn!("Connection to {} timed out: {}", dst, e);
+                            }
+                            crate::proxy::ProxyError::TargetUnreachable { target, reply_code } => {
+                                debug!("Target {} unreachable (SOCKS5 reply {:#04x})", target, reply_code);
                             }
                             _ => {
                                 error!("Error processing connection: {e:?}");

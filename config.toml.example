@@ -6,8 +6,14 @@ username = ""
 password = ""
 
 [client]
-# UDP-specific configuration (optional, defaults to same as TCP port)
-# udp_port = 12345
+# UDP listen port (optional).
+# Defaults to TCP port + 1 (e.g. 1081 when port = 1080).
+# Keeping TCP and UDP on separate ports allows the TCP listener to use a
+# dual-stack [::] socket while the UDP proxy binds its own IPv4 + IPv6
+# sockets on the UDP port — avoiding any port conflict between the two.
+# Set explicitly if you need a specific port (e.g. when iptables rules
+# already reference a fixed UDP port).
+# udp_port = 1081
 
 # UDP desynchronization configuration
 udp_desync_enabled = false
@@ -46,6 +52,9 @@ dns_socks5_upstream_dns = "8.8.8.8:53"     # DNS server to query through proxy
 # dns_doh_urls = ["https://dns.google/dns-query", "https://cloudflare-dns.com/dns-query"]
 # dns_doh_use_socks5 = false  # Route DoH through SOCKS5 proxy
 # dns_doh_socks5_proxy = "socks5://127.0.0.1:1080"
+# For IPv6 proxy address, enclose the address in square brackets:
+# dns_doh_socks5_proxy = "socks5://[2001:db8::1]:1080"
+# Bare IPv6 (without brackets) is also accepted and normalised automatically.
 
 # DNS Bootstrap (for DoT/DoH server domain resolution)
 dns_bootstrap_enabled = true
@@ -55,21 +64,52 @@ dns_bootstrap_servers = ["8.8.8.8:53", "1.1.1.1:53"]
 # Listens on UDP port 53 and forwards queries through Internal DNS Resolver
 # This prevents LAN clients from making direct DNS queries to ISP
 dns_proxy_enabled = true
+# Listen address for the DNS proxy.
+# "0.0.0.0" — IPv4 only (default, safe for all setups)
+# "::"      — Dual-stack: accepts both IPv4 and IPv6 clients from a single socket.
+#             Recommended when LAN clients may query via IPv6 or when you want to
+#             prevent IPv6 DNS leaks (requires matching ip6tables rules to redirect
+#             port 53 traffic to this proxy).
 dns_proxy_listen = "0.0.0.0"
 dns_proxy_port = 53
 dns_proxy_cache_size_limit = 10000
 dns_proxy_cache_ttl = 3600
 dns_proxy_log_queries = false  # Set to true for debugging
 
-# ============ Legacy DNS Settings (ignored with new system) ============
-# dns_enabled = false  # OLD setting - ignored
-# dns_listen_port = 53  # OLD setting - use dns_proxy_port instead
-# dns_cache_ttl = 3600  # OLD setting - use dns_resolver_cache_ttl/dns_proxy_cache_ttl
-
 # ============ Other Settings ============
 
 # Upstream proxy connection timeout in seconds (default: 10)
 upstream_proxy_timeout = 10
+
+# ============ Circuit Breaker Configuration ============
+# Monitors upstream proxy health and fast-fails connections when the proxy is
+# unreachable, instead of waiting for the full upstream_proxy_timeout on each
+# connection. When the proxy recovers, traffic is gradually ramped back up.
+#
+# Disable if you prefer connections to time out naturally rather than get an
+# immediate RST, or if you have a single upstream proxy and the fast-fail
+# behaviour causes more disruption than the timeout would.
+#
+# circuit_breaker_enabled = true
+#
+# Number of consecutive failures required to open the circuit (default: 5).
+# Increase to tolerate more transient errors before blocking; decrease to
+# react faster to a dead proxy. Each failure must be at least 1 second apart
+# (rapid burst errors within 1s count as one failure).
+# circuit_breaker_threshold = 5
+#
+# Seconds to wait before probing the failed proxy again (default: 30).
+# circuit_breaker_cooldown = 30
+#
+# Seconds between background SOCKS5 health-probe runs (default: 10).
+# circuit_breaker_probe_interval = 10
+#
+# Timeout for the SOCKS5 health probe TCP connect (default: 3).
+# circuit_breaker_probe_timeout = 3
+#
+# Force-reset the circuit after this many seconds even without a successful
+# probe, to avoid indefinite blacklisting (default: 300 = 5 min).
+# circuit_breaker_max_open_duration = 300
 
 # SNI routing enhancements
 availability_check = true

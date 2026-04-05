@@ -1106,14 +1106,19 @@ async fn recv_udp_packet_with_orig_dst(socket: &UdpSocket) -> Result<UdpPacket> 
                 }
             }
 
-            // Check for IPv6 original destination address in ancillary data
+            // Check for IPv6 original destination address in ancillary data.
+            // On a dual-stack socket, IPv4 packets also arrive here as IPv4-mapped
+            // addresses (::ffff:a.b.c.d); unwrap them to plain IpAddr::V4.
             if cmsg.cmsg_level == SOL_IPV6 && cmsg.cmsg_type == libc::IPV6_ORIGDSTADDR {
                 // Validate control message length for sockaddr_in6
                 if cmsg.cmsg_len as usize >= mem::size_of::<libc::cmsghdr>() + mem::size_of::<libc::sockaddr_in6>() {
                     let addr = unsafe { &*(libc::CMSG_DATA(control_ptr as *const _) as *const libc::sockaddr_in6) };
-                    let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+                    let ipv6 = Ipv6Addr::from(addr.sin6_addr.s6_addr);
                     let port = u16::from_be(addr.sin6_port);
-                    original_dst = Some(SocketAddr::new(IpAddr::V6(ip), port));
+                    // Convert IPv4-mapped (::ffff:a.b.c.d) to plain IPv4 so downstream
+                    // code treats it as a real IPv4 destination.
+                    let ip = ipv6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(ipv6));
+                    original_dst = Some(SocketAddr::new(ip, port));
                     debug!("Found IPv6 original destination in ancillary data: {}", original_dst.unwrap());
                     break;
                 } else {
@@ -1154,9 +1159,11 @@ async fn recv_udp_packet_with_orig_dst(socket: &UdpSocket) -> Result<UdpPacket> 
                 ));
             }
             let addr6 = unsafe { *(&src_addr as *const _ as *const libc::sockaddr_in6) };
-            let ip = Ipv6Addr::from(addr6.sin6_addr.s6_addr);
+            let ipv6 = Ipv6Addr::from(addr6.sin6_addr.s6_addr);
             let port = u16::from_be(addr6.sin6_port);
-            SocketAddr::new(IpAddr::V6(ip), port)
+            // Unwrap IPv4-mapped addresses (::ffff:a.b.c.d) from a dual-stack socket.
+            let ip = ipv6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(ipv6));
+            SocketAddr::new(ip, port)
         }
         family => {
             return Err(anyhow!(
@@ -1783,25 +1790,29 @@ pub async fn create_socks5_udp_associate(
             IpAddr::V6(ip) => ip.is_unspecified(),  // ::
         };
         if is_wildcard {
-            // Extract IP from proxy_addr "host:port"
-            if let Some(colon_pos) = proxy_addr.rfind(':') {
-                let host_part = &proxy_addr[..colon_pos];
-                if let Ok(proxy_ip) = host_part.parse::<IpAddr>() {
-                    let fixed = SocketAddr::new(proxy_ip, send_to.port());
-                    info!(
-                        "SOCKS5 UDP ASSOCIATE: Replacing wildcard bind address {} with proxy IP: {}",
-                        send_to, fixed
-                    );
-                    fixed
-                } else {
-                    warn!(
-                        "SOCKS5 UDP ASSOCIATE: bind address is wildcard {} but cannot parse proxy IP from '{}', using as-is",
-                        send_to, proxy_addr
-                    );
-                    send_to
-                }
+            // Extract IP from proxy_addr which may be "host:port" or "[ipv6]:port"
+            let proxy_ip: Option<IpAddr> = if proxy_addr.starts_with('[') {
+                // Bracketed IPv6: [addr]:port
+                proxy_addr.find(']')
+                    .and_then(|end| proxy_addr[1..end].parse::<IpAddr>().ok())
             } else {
-                warn!("SOCKS5 UDP ASSOCIATE: bind address is wildcard {} but proxy_addr '{}' has no port separator", send_to, proxy_addr);
+                // IPv4 or hostname: addr:port — use rfind to handle any embedded colons
+                proxy_addr.rfind(':')
+                    .and_then(|pos| proxy_addr[..pos].parse::<IpAddr>().ok())
+            };
+
+            if let Some(ip) = proxy_ip {
+                let fixed = SocketAddr::new(ip, send_to.port());
+                info!(
+                    "SOCKS5 UDP ASSOCIATE: Replacing wildcard bind address {} with proxy IP: {}",
+                    send_to, fixed
+                );
+                fixed
+            } else {
+                warn!(
+                    "SOCKS5 UDP ASSOCIATE: bind address is wildcard {} but cannot parse proxy IP from '{}', using as-is",
+                    send_to, proxy_addr
+                );
                 send_to
             }
         } else {
@@ -2089,11 +2100,20 @@ fn is_persistent_send_error(err: &anyhow::Error) -> bool {
         || err_str.contains("No route to host")
 }
 
-/// Extract proxy address from a SessionRoute, formatted as "host:port"
+/// Extract proxy address from a SessionRoute, formatted as "host:port".
+/// IPv6 addresses are enclosed in brackets per RFC 3986 (e.g., "[::1]:1080").
 fn proxy_addr_from_route(route: &SessionRoute, proxy_opt: &Option<Proxy>) -> Option<String> {
     match route {
         SessionRoute::Proxy(_) => {
-            proxy_opt.as_ref().map(|p| format!("{}:{}", p.server_addr, p.server_port))
+            proxy_opt.as_ref().map(|p| {
+                // Wrap bare IPv6 addresses in brackets so the resulting string
+                // can be reliably parsed back by rfind(':') later.
+                if p.server_addr.contains(':') && !p.server_addr.starts_with('[') {
+                    format!("[{}]:{}", p.server_addr, p.server_port)
+                } else {
+                    format!("{}:{}", p.server_addr, p.server_port)
+                }
+            })
         }
         SessionRoute::Direct => None,
     }
@@ -2288,28 +2308,29 @@ pub async fn run_udp_proxy(
     info!("Starting UDP proxy on port {} with config: desync_enabled={}, min_size={}, max_size={}",
           config.port, config.udp_desync_enabled, config.udp_desync_min_size, config.udp_desync_max_size);
 
-    // Bind separate IPv4 and IPv6 sockets.
-    // Relying on a single "dual-stack" [::]:PORT socket is fragile because
-    // net.ipv6.bindv6only=1 (or socket-level IPV6_V6ONLY=1) prevents IPv4 QUIC
-    // packets from reaching the listener.
-    let ipv4_addr = format!("0.0.0.0:{}", config.port);
-    let ipv4_socket = Arc::new(UdpSocket::bind(&ipv4_addr).await?);
-    info!("IPv4 UDP socket bound to {}", ipv4_addr);
-    let ipv4_fd = ipv4_socket.as_ref().as_raw_fd();
-
-    let ipv6_addr = format!("[::]:{}", config.port);
-    let ipv6_socket = match UdpSocket::bind(&ipv6_addr).await {
-        Ok(socket) => {
-            info!("IPv6 UDP socket bound to {}", ipv6_addr);
-            Some(Arc::new(socket))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            warn!("IPv6 UDP bind failed with address in use, skipping IPv6 support");
-            None
-        }
-        Err(e) => return Err(anyhow!("Failed to bind IPv6 UDP socket: {}", e)),
+    // Bind a single dual-stack [::]:port UDP socket (IPV6_V6ONLY=0).
+    // We use socket2 so we can call set_only_v6(false) before bind(), which
+    // tokio::UdpSocket::bind() does not allow (it performs socket+bind atomically).
+    // Explicit IPV6_V6ONLY=0 overrides any system-level net.ipv6.bindv6only=1 sysctl.
+    let dual_stack_socket = {
+        let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
+            .map_err(|e| anyhow!("Failed to create dual-stack UDP socket: {}", e))?;
+        sock.set_only_v6(false)
+            .map_err(|e| anyhow!("Failed to set IPV6_V6ONLY=0 on UDP socket: {}", e))?;
+        sock.set_nonblocking(true)
+            .map_err(|e| anyhow!("Failed to set O_NONBLOCK on UDP socket: {}", e))?;
+        sock.set_reuse_address(true)
+            .map_err(|e| anyhow!("Failed to set SO_REUSEADDR on UDP socket: {}", e))?;
+        let bind_addr: SocketAddr = format!("[::]:{}",  config.port).parse()
+            .map_err(|e| anyhow!("Invalid UDP bind address: {}", e))?;
+        sock.bind(&bind_addr.into())
+            .map_err(|e| anyhow!("Failed to bind dual-stack UDP socket to {}: {}", bind_addr, e))?;
+        let std_sock = std::net::UdpSocket::from(sock);
+        Arc::new(UdpSocket::from_std(std_sock)
+            .map_err(|e| anyhow!("Failed to convert UDP socket to tokio: {}", e))?)
     };
-    let ipv6_fd = ipv6_socket.as_ref().map(|s| s.as_raw_fd());
+    info!("Dual-stack UDP socket bound to [::]:{}  (IPV6_V6ONLY=0)", config.port);
+    let dual_fd = dual_stack_socket.as_ref().as_raw_fd();
 
     let sessions: Arc<DashMap<SessionKey, Arc<UdpSession>>> = Arc::new(DashMap::new());
 
@@ -2361,86 +2382,47 @@ pub async fn run_udp_proxy(
     });
 
 
-    // Set transparent proxy options for IPv4 and IPv6 sockets.
+    // Set transparent proxy options on the dual-stack socket.
+    // IPV6_TRANSPARENT covers both native IPv6 and IPv4-mapped addresses (dual-stack).
     // NOTE: SO_MARK must match the fwmark used in iptables/nftables TPROXY rule.
     let one = 1i32;
     let mark = 1i32;
     unsafe {
-        // ---- IPv4 socket options ----
         let ret = libc::setsockopt(
-            ipv4_fd,
-            SOL_IP,
-            IP_TRANSPARENT,
+            dual_fd,
+            SOL_IPV6,
+            IPV6_TRANSPARENT,
             &one as *const _ as *const _,
             mem::size_of::<i32>() as libc::socklen_t,
         );
         if ret != 0 {
-            return Err(anyhow!("Failed to set IP_TRANSPARENT (IPv4): {}", std::io::Error::last_os_error()));
+            return Err(anyhow!("Failed to set IPV6_TRANSPARENT on dual-stack UDP: {}", std::io::Error::last_os_error()));
         }
 
         let ret = libc::setsockopt(
-            ipv4_fd,
+            dual_fd,
             libc::SOL_SOCKET,
             SO_MARK,
             &mark as *const _ as *const _,
             mem::size_of::<i32>() as libc::socklen_t,
         );
         if ret != 0 {
-            return Err(anyhow!("Failed to set SO_MARK (IPv4): {}", std::io::Error::last_os_error()));
+            return Err(anyhow!("Failed to set SO_MARK on dual-stack UDP: {}", std::io::Error::last_os_error()));
         }
 
         let ret = libc::setsockopt(
-            ipv4_fd,
-            SOL_IP,
-            IP_RECVORIGDSTADDR,
+            dual_fd,
+            SOL_IPV6,
+            IPV6_RECVORIGDSTADDR,
             &one as *const _ as *const _,
             mem::size_of::<i32>() as libc::socklen_t,
         );
         if ret != 0 {
-            return Err(anyhow!("Failed to set IP_RECVORIGDSTADDR (IPv4): {}", std::io::Error::last_os_error()));
-        }
-
-        // ---- IPv6 socket options ----
-        if let Some(ipv6_fd) = ipv6_fd {
-            let ret = libc::setsockopt(
-                ipv6_fd,
-                SOL_IPV6,
-                IPV6_TRANSPARENT,
-                &one as *const _ as *const _,
-                mem::size_of::<i32>() as libc::socklen_t,
-            );
-            if ret != 0 {
-                return Err(anyhow!("Failed to set IPV6_TRANSPARENT (IPv6): {}", std::io::Error::last_os_error()));
-            }
-
-            let ret = libc::setsockopt(
-                ipv6_fd,
-                libc::SOL_SOCKET,
-                SO_MARK,
-                &mark as *const _ as *const _,
-                mem::size_of::<i32>() as libc::socklen_t,
-            );
-            if ret != 0 {
-                return Err(anyhow!("Failed to set SO_MARK (IPv6): {}", std::io::Error::last_os_error()));
-            }
-
-            let ret = libc::setsockopt(
-                ipv6_fd,
-                SOL_IPV6,
-                IPV6_RECVORIGDSTADDR,
-                &one as *const _ as *const _,
-                mem::size_of::<i32>() as libc::socklen_t,
-            );
-            if ret != 0 {
-                return Err(anyhow!("Failed to set IPV6_RECVORIGDSTADDR (IPv6): {}", std::io::Error::last_os_error()));
-            }
+            return Err(anyhow!("Failed to set IPV6_RECVORIGDSTADDR on dual-stack UDP: {}", std::io::Error::last_os_error()));
         }
     }
 
-    // Single success message after everything is set up
-    let listener_desc = if ipv6_socket.is_some() { "separate IPv4+IPv6 listeners" } else { "IPv4 only listener" };
-    
-    println!("Listening UDP on port {} (transparent mode, {})", config.port, listener_desc);
+    println!("Listening UDP on port {} (transparent mode, dual-stack [::]:{})", config.port, config.port);
     
     // Use semaphore to limit concurrent packet processing and prevent overload
     let semaphore = Arc::new(Semaphore::new(UDP_CONCURRENT_PROCESSING_LIMIT));
@@ -2554,20 +2536,12 @@ pub async fn run_udp_proxy(
         })
     };
 
-    // Run both listeners. This avoids dependency on v4-mapped IPv6 sockets and
-    // guarantees IPv4 QUIC (UDP/443) reaches the proxy.
-    let ipv4_handle = spawn_receiver(ipv4_socket.clone(), "ipv4");
-    if let Some(ipv6_socket) = ipv6_socket {
-        let ipv6_handle = spawn_receiver(ipv6_socket.clone(), "ipv6");
-        match tokio::try_join!(ipv4_handle, ipv6_handle) {
-            Ok(_) => info!("UDP proxy listeners finished normally"),
-            Err(e) => return Err(anyhow!("UDP proxy task panicked or failed: {}", e)),
-        }
-    } else {
-        match ipv4_handle.await {
-            Ok(_) => info!("UDP proxy listener finished normally"),
-            Err(e) => return Err(anyhow!("UDP proxy task panicked or failed: {}", e)),
-        }
+    // Single dual-stack listener handles both IPv4 (via IPv4-mapped ::ffff:a.b.c.d)
+    // and native IPv6 traffic on one socket.
+    let handle = spawn_receiver(dual_stack_socket.clone(), "dual-stack");
+    match handle.await {
+        Ok(_) => info!("UDP proxy listener finished normally"),
+        Err(e) => return Err(anyhow!("UDP proxy task panicked or failed: {}", e)),
     }
     
     Ok(())

@@ -7,9 +7,14 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpStream;
 
 // Standard socket options for Linux (defined as constants for better maintainability)
-pub const IP_TRANSPARENT: i32 = 19;    // Standard value for IP_TRANSPARENT (defined once)
-pub const SO_REUSEPORT: i32 = 15;      // SO_REUSEPORT
-pub const SO_MARK: i32 = 36;           // Standard value for SO_MARK (to bypass TPROXY loops)
+pub const IP_TRANSPARENT: i32 = 19;     // IP_TRANSPARENT (SOL_IP level)
+pub const IPV6_TRANSPARENT: i32 = 75;   // IPV6_TRANSPARENT (SOL_IPV6 level)
+pub const SO_REUSEPORT: i32 = 15;       // SO_REUSEPORT
+pub const SO_MARK: i32 = 36;            // SO_MARK (to bypass TPROXY loops)
+const SOL_IP: i32 = 0;                  // IPPROTO_IP — Linux protocol level for IPv4 options
+const SOL_IPV6: i32 = 41;              // IPPROTO_IPV6 — Linux protocol level for IPv6 options
+const IP_RECVORIGDSTADDR: i32 = 20;    // IP_RECVORIGDSTADDR (IPv4 original destination in ancdata)
+const IPV6_RECVORIGDSTADDR: i32 = 74;  // IPV6_RECVORIGDSTADDR (IPv6 original destination in ancdata)
 
 // Default socket configuration constants
 const DEFAULT_LISTEN_BACKLOG: i32 = 128;
@@ -177,7 +182,7 @@ pub async fn connect_tcp_with_mark<A: tokio::net::ToSocketAddrs>(addr: A) -> any
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
-            libc::SO_MARK,
+            SO_MARK,
             &mark as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
@@ -198,7 +203,7 @@ pub fn set_socket_mark(fd: libc::c_int, mark: u32) -> std::io::Result<()> {
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
-            libc::SO_MARK,
+            SO_MARK,
             &mark as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
@@ -271,9 +276,14 @@ pub fn create_transparent_tcp_socket(
     port: u16,
     config: TransparentSocketConfig,
 ) -> Result<std::net::TcpListener, TransparentError> {
-    // Parse and validate the socket address early
+    // Parse and validate the socket address early.
+    // IPv6 addresses (containing ':') must be wrapped in brackets for socket address parsing.
     let socket_addr = {
-        let addr_str = format!("{}:{}", listen_addr, port);
+        let addr_str = if listen_addr.contains(':') {
+            format!("[{}]:{}", listen_addr, port)
+        } else {
+            format!("{}:{}", listen_addr, port)
+        };
         addr_str.parse::<SocketAddr>()
             .map_err(|e| TransparentError::InvalidAddress(format!("{}: {}", addr_str, e)))?
     };
@@ -294,6 +304,16 @@ pub fn create_transparent_tcp_socket(
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .map_err(|e| TransparentError::SocketCreationFailed(e.to_string()))?;
 
+    // For IPv6 sockets, disable IPV6_V6ONLY to enable dual-stack (accept IPv4-mapped addresses
+    // as well). This MUST happen before bind(). See dns_proxy.rs for the same pattern.
+    if socket_addr.is_ipv6() {
+        socket.set_only_v6(false)
+            .map_err(|e| TransparentError::SocketOptionFailed {
+                option: "IPV6_V6ONLY=0".to_string(),
+                error: e.to_string(),
+            })?;
+    }
+
     // Set basic socket options
     socket.set_reuse_address(true)
         .map_err(|e| TransparentError::SocketOptionFailed {
@@ -313,19 +333,34 @@ pub fn create_transparent_tcp_socket(
         }
     }
 
-    // IP_TRANSPARENT (required for transparent proxying)
+    // TRANSPARENT socket option: use IPV6_TRANSPARENT for IPv6 (including dual-stack)
+    // and IP_TRANSPARENT for IPv4-only sockets.
     if config.transparent {
-        if let Err(e) = set_socket_option(fd, libc::SOL_IP, IP_TRANSPARENT, val, "IP_TRANSPARENT") {
-            log::warn!("Failed to set IP_TRANSPARENT: {}", e);
-            transparent_options_failed = true;
+        if socket_addr.is_ipv6() {
+            // IPV6_TRANSPARENT enables TPROXY for both native IPv6 and IPv4-mapped
+            // addresses received on a dual-stack socket.
+            if let Err(e) = set_socket_option(fd, SOL_IPV6, IPV6_TRANSPARENT, val, "IPV6_TRANSPARENT") {
+                log::warn!("Failed to set IPV6_TRANSPARENT: {}", e);
+                transparent_options_failed = true;
+            }
+        } else {
+            if let Err(e) = set_socket_option(fd, SOL_IP, IP_TRANSPARENT, val, "IP_TRANSPARENT") {
+                log::warn!("Failed to set IP_TRANSPARENT: {}", e);
+                transparent_options_failed = true;
+            }
         }
     }
 
-    // IP_RECVORIGDSTADDR (for getting original destination)
+    // RECVORIGDSTADDR: use the address-family-appropriate level.
     if config.recv_orig_dst {
-        if let Err(e) = set_socket_option(fd, libc::SOL_IP, libc::IP_RECVORIGDSTADDR, val, "IP_RECVORIGDSTADDR") {
-            log::warn!("Failed to set IP_RECVORIGDSTADDR: {}", e);
-            // This is not critical for basic functionality
+        if socket_addr.is_ipv6() {
+            if let Err(e) = set_socket_option(fd, SOL_IPV6, IPV6_RECVORIGDSTADDR, val, "IPV6_RECVORIGDSTADDR") {
+                log::warn!("Failed to set IPV6_RECVORIGDSTADDR: {}", e);
+            }
+        } else {
+            if let Err(e) = set_socket_option(fd, SOL_IP, IP_RECVORIGDSTADDR, val, "IP_RECVORIGDSTADDR") {
+                log::warn!("Failed to set IP_RECVORIGDSTADDR: {}", e);
+            }
         }
     }
 

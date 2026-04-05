@@ -34,6 +34,8 @@ const DEFAULT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(30);
 const UDP_ASSOCIATE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes for idle UDP associate TCP keepalive
 const MAX_UDP_MAP_SIZE: usize = 1000;
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONNECTION_LIFETIME_SECS: u64 = 3600; // 1 hour max per TCP connection
 
 // Buffer sizes
 const TCP_BUFFER_SIZE: usize = 8192;
@@ -325,6 +327,39 @@ async fn resolve_domain_to_ip(domain: String) -> ProxyResult<Option<std::net::Ip
 }
 
 
+/// Send a SOCKS5 error response with the given reply code.
+/// Reply codes per RFC 1928:
+///   0x01 = General SOCKS server failure
+///   0x04 = Host unreachable
+///   0x05 = Connection refused
+///   0x06 = TTL expired (used for timeout)
+async fn send_socks5_error_response(stream: &mut TcpStream, reply_code: u8) {
+    let resp = [0x05, reply_code, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let _ = stream.write_all(&resp).await;
+}
+
+/// Map a `ProxyError` from connection/DNS to a SOCKS5 reply code.
+fn socks5_reply_code_for_error(err: &ProxyError) -> u8 {
+    match err {
+        ProxyError::DnsResolution(_) => 0x04, // Host unreachable
+        ProxyError::Timeout(msg) => {
+            if msg.contains("DNS") {
+                0x04 // Host unreachable (DNS timeout)
+            } else {
+                0x06 // TTL expired (connection timeout)
+            }
+        }
+        ProxyError::Connection(msg) => {
+            if msg.contains("refused") || msg.contains("Refused") {
+                0x05 // Connection refused
+            } else {
+                0x01 // General SOCKS server failure
+            }
+        }
+        _ => 0x01, // General SOCKS server failure
+    }
+}
+
 /// Parse SOCKS5 CONNECT request after header has been read
 async fn handle_socks5_connect_request_after_header(stream: &mut TcpStream, atyp: u8, config: &ServerConfig) -> ProxyResult<(TcpStream, SocketAddr)> {
     let mut buf = [0u8; 256];
@@ -361,11 +396,24 @@ async fn handle_socks5_connect_request_after_header(stream: &mut TcpStream, atyp
             };
 
             let lookup_future = resolver.lookup_ip(normalized_domain);
-            let response = timeout(DEFAULT_DNS_TIMEOUT, lookup_future).await
-                .map_err(|_| ProxyError::Timeout("DNS lookup timeout".to_string()))?
-                .map_err(|e| ProxyError::DnsResolution(format!("DNS resolution failed for {}: {}", domain, e)))?;
-            let ip_addr = response.iter().next()
-                .ok_or_else(|| ProxyError::DnsResolution(format!("No IP addresses found for domain: {}", domain)))?;
+            let dns_result = timeout(DEFAULT_DNS_TIMEOUT, lookup_future).await
+                .map_err(|_| ProxyError::Timeout("DNS lookup timeout".to_string()))
+                .and_then(|r| r.map_err(|e| ProxyError::DnsResolution(format!("DNS resolution failed for {}: {}", domain, e))));
+            let response = match dns_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    send_socks5_error_response(stream, socks5_reply_code_for_error(&e)).await;
+                    return Err(e);
+                }
+            };
+            let ip_addr = match response.iter().next() {
+                Some(ip) => ip,
+                None => {
+                    let e = ProxyError::DnsResolution(format!("No IP addresses found for domain: {}", domain));
+                    send_socks5_error_response(stream, socks5_reply_code_for_error(&e)).await;
+                    return Err(e);
+                }
+            };
             SocketAddr::new(ip_addr, port)
         }
         4 => { // IPv6
@@ -394,17 +442,22 @@ async fn handle_socks5_connect_request_after_header(stream: &mut TcpStream, atyp
         false
     };
     if is_self_loop {
-        // Send failure response
-        stream.write_all(&[5u8, 1u8, 0u8, 1u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8][..]).await?;
+        send_socks5_error_response(stream, 0x01).await; // General SOCKS server failure
         return Err(ProxyError::Connection("Cannot connect to self (loop prevention)".to_string()));
     }
 
-    // Send success response
-    stream.write_all(&[5u8, 0u8, 0u8, 1u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8][..]).await?;
-
-    // Create new connection
-    let target_stream = create_new_connection(target_addr).await?;
+    // Connect to target BEFORE sending success response (per RFC 1928)
+    let target_stream = match create_new_connection(target_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            send_socks5_error_response(stream, socks5_reply_code_for_error(&e)).await;
+            return Err(e);
+        }
+    };
     debug!("Connected to target: {}", target_addr);
+
+    // Send success response only after connection succeeded
+    stream.write_all(&[5u8, 0u8, 0u8, 1u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8][..]).await?;
 
     Ok((target_stream, target_addr))
 }
@@ -440,42 +493,53 @@ async fn forward_streams(client: TcpStream, target: TcpStream) -> ProxyResult<()
         result
     });
 
-    // Wait for BOTH directions (don't fail fast)
-    let (c2t_result, t2c_result) = tokio::join!(client_to_target, target_to_client);
+    let c2t_abort = client_to_target.abort_handle();
+    let t2c_abort = target_to_client.abort_handle();
+    let max_lifetime = Duration::from_secs(MAX_CONNECTION_LIFETIME_SECS);
 
-    let err1 = match c2t_result {
-        Ok(Ok(_)) => None,
-        Ok(Err(e)) => Some(e),
-        Err(e) => return Err(ProxyError::Connection(format!("Task panicked: {}", e))),
-    };
-    let err2 = match t2c_result {
-        Ok(Ok(_)) => None,
-        Ok(Err(e)) => Some(e),
-        Err(e) => return Err(ProxyError::Connection(format!("Task panicked: {}", e))),
-    };
+    tokio::select! {
+        (c2t_result, t2c_result) = async { tokio::join!(client_to_target, target_to_client) } => {
+            let err1 = match c2t_result {
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) => Some(e),
+                Err(e) => return Err(ProxyError::Connection(format!("Task panicked: {}", e))),
+            };
+            let err2 = match t2c_result {
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) => Some(e),
+                Err(e) => return Err(ProxyError::Connection(format!("Task panicked: {}", e))),
+            };
 
-    // Classify errors: data-plane errors are normal and swallowed
-    match (err1, err2) {
-        (None, None) => Ok(()),
-        (Some(e), None) | (None, Some(e)) => {
-            if is_data_plane_error(&e) {
-                debug!("Stream forwarding ended (peer disconnect): {}", e);
-                Ok(())
-            } else {
-                Err(ProxyError::Io(e))
+            // Classify errors: data-plane errors are normal and swallowed
+            match (err1, err2) {
+                (None, None) => Ok(()),
+                (Some(e), None) | (None, Some(e)) => {
+                    if is_data_plane_error(&e) {
+                        debug!("Stream forwarding ended (peer disconnect): {}", e);
+                        Ok(())
+                    } else {
+                        Err(ProxyError::Io(e))
+                    }
+                }
+                (Some(e1), Some(e2)) => {
+                    let e1_data = is_data_plane_error(&e1);
+                    let e2_data = is_data_plane_error(&e2);
+                    match (e1_data, e2_data) {
+                        (true, true) => {
+                            debug!("Stream forwarding ended (both sides disconnected): {} / {}", e1, e2);
+                            Ok(())
+                        }
+                        (false, _) => Err(ProxyError::Io(e1)),
+                        (_, false) => Err(ProxyError::Io(e2)),
+                    }
+                }
             }
         }
-        (Some(e1), Some(e2)) => {
-            let e1_data = is_data_plane_error(&e1);
-            let e2_data = is_data_plane_error(&e2);
-            match (e1_data, e2_data) {
-                (true, true) => {
-                    debug!("Stream forwarding ended (both sides disconnected): {} / {}", e1, e2);
-                    Ok(())
-                }
-                (false, _) => Err(ProxyError::Io(e1)),
-                (_, false) => Err(ProxyError::Io(e2)),
-            }
+        _ = tokio::time::sleep(max_lifetime) => {
+            c2t_abort.abort();
+            t2c_abort.abort();
+            debug!("Server connection exceeded max lifetime ({}s), tasks aborted", MAX_CONNECTION_LIFETIME_SECS);
+            Ok(())
         }
     }
 }
@@ -839,12 +903,20 @@ async fn handle_socks5_udp_tunnel_after_header(stream: TcpStream, atyp: u8, _con
 async fn handle_socks5_connection(mut stream: TcpStream, config: Arc<ServerConfig>) -> ProxyResult<()> {
     let client_addr = stream.peer_addr()?;
 
-    // SOCKS5 authentication
-    handle_socks5_auth(&mut stream, &config).await?;
+    // SOCKS5 authentication (with timeout to prevent stalled clients from holding slots)
+    match timeout(DEFAULT_HANDSHAKE_TIMEOUT, handle_socks5_auth(&mut stream, &config)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(ProxyError::Timeout(format!("SOCKS5 auth timeout from {}", client_addr))),
+    }
 
-    // Check command
+    // Check command (with timeout)
     let mut buf = [0u8; 4];
-    stream.read_exact(&mut buf[..]).await?;
+    match timeout(DEFAULT_HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf[..])).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(ProxyError::Io(e)),
+        Err(_) => return Err(ProxyError::Timeout(format!("SOCKS5 command read timeout from {}", client_addr))),
+    }
     if buf[0] != 5 {
         return Err(ProxyError::SocksProtocol("Invalid SOCKS5 request".to_string()));
     }
@@ -853,8 +925,12 @@ async fn handle_socks5_connection(mut stream: TcpStream, config: Arc<ServerConfi
 
     match cmd {
         SOCKS_CMD_CONNECT => {
-            // SOCKS5 CONNECT request - parse the rest of the request
-            let (target_stream, target_addr) = handle_socks5_connect_request_after_header(&mut stream, atyp, &config).await?;
+            // SOCKS5 CONNECT request - parse the rest of the request (with timeout)
+            let (target_stream, target_addr) = match timeout(DEFAULT_HANDSHAKE_TIMEOUT, handle_socks5_connect_request_after_header(&mut stream, atyp, &config)).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(ProxyError::Timeout(format!("SOCKS5 CONNECT request timeout from {}", client_addr))),
+            };
 
             // Forward data
             if let Err(e) = forward_streams(stream, target_stream).await {

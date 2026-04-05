@@ -18,7 +18,7 @@
 //!   - Exponential backoff: probe interval grows after repeated failures
 //!   - Jitter: randomized timing prevents thundering herd on recovery
 //!   - SoftRecovery: gradual traffic ramp-up prevents re-tripping after recovery
-//!   - Failure classification: auth/protocol errors trip immediately, transient errors use threshold
+//!   - Failure classification: auth errors trip immediately, all others use threshold-based tripping
 //!   - Recovery notifications: subscribers notified when proxy recovers
 
 use dashmap::DashMap;
@@ -38,9 +38,14 @@ use tokio::time::{sleep, timeout};
 /// Circuit breaker configuration (parsed from config.toml `[client]` section).
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
+    /// Whether the circuit breaker is enabled at all (default true).
+    /// Set to false to completely disable fast-failing and health probes.
+    /// When disabled, all proxies are always treated as healthy, and no
+    /// failures are recorded — connections simply time out naturally.
+    pub enabled: bool,
     /// Seconds before probing a failed proxy again (default 30).
     pub cooldown: Duration,
-    /// Consecutive failures required to trip the circuit (default 3).
+    /// Consecutive failures required to trip the circuit (default 5).
     pub failure_threshold: u32,
     /// Seconds between background health probes when circuit is open (default 10).
     pub probe_interval: Duration,
@@ -54,8 +59,9 @@ pub struct HealthConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             cooldown: Duration::from_secs(30),
-            failure_threshold: 3,
+            failure_threshold: 5,
             probe_interval: Duration::from_secs(10),
             probe_timeout: Duration::from_secs(3),
             max_open_duration: Duration::from_secs(300),
@@ -67,15 +73,18 @@ impl Default for HealthConfig {
 
 /// Classification of proxy failures for smarter circuit breaker behavior.
 ///
-/// Auth/protocol errors trip the circuit immediately since retrying won't help.
-/// Transient/network errors use the normal threshold-based approach.
+/// Auth errors trip the circuit immediately since retrying a bad password won't help.
+/// Protocol errors use the normal threshold-based approach: a single garbled SOCKS5
+/// response can be a transient TCP corruption, not necessarily a permanent misconfiguration.
+/// Transient/network errors also use the threshold-based approach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureType {
     /// Timeout, temporary network issue — use threshold-based tripping
     Transient,
     /// SOCKS5 authentication rejected — immediate trip (config error)
     AuthFailure,
-    /// Invalid SOCKS5 response / protocol mismatch — immediate trip
+    /// Invalid SOCKS5 response / protocol mismatch — threshold-based
+    /// (a single garbled packet shouldn't take down the whole proxy)
     ProtocolError,
     /// Connection refused, unreachable, network errors — threshold-based
     NetworkError,
@@ -104,8 +113,13 @@ impl FailureType {
 
     /// Whether this failure type should trip the circuit immediately
     /// (bypassing the consecutive failure threshold).
+    ///
+    /// Only `AuthFailure` trips immediately: a wrong password will never succeed,
+    /// so there is no point in accumulating failures toward a threshold.
+    /// `ProtocolError` uses threshold-based tripping since a single malformed
+    /// SOCKS5 response can be a transient TCP corruption, not a misconfiguration.
     pub fn is_immediate_trip(&self) -> bool {
-        matches!(self, FailureType::AuthFailure | FailureType::ProtocolError)
+        matches!(self, FailureType::AuthFailure)
     }
 }
 
@@ -144,8 +158,8 @@ impl fmt::Display for ProxyStatus {
 /// in degraded conditions. Combined with failure-ratio tolerance (not
 /// just consecutive successes), this is still a strong recovery signal.
 const SOFT_RECOVERY_SUCCESS_THRESHOLD: u32 = 5;
-/// In SoftRecovery, allow 1 out of every N calls through (10% traffic).
-const SOFT_RECOVERY_TRAFFIC_RATIO: u64 = 10;
+/// In SoftRecovery, allow 1 out of every N calls through (25% traffic).
+const SOFT_RECOVERY_TRAFFIC_RATIO: u64 = 4;
 /// Maximum backoff multiplier for probe intervals (caps at 8x base interval).
 const MAX_PROBE_BACKOFF_MULTIPLIER: u32 = 8;
 /// Maximum jitter as percentage of cooldown (25%).
@@ -296,9 +310,13 @@ impl ProxyHealthTracker {
     ///
     /// Returns `true` for Healthy, Degraded.
     /// Returns `false` for CircuitOpen and HalfOpen.
-    /// For SoftRecovery: allows ~25% of traffic through.
+    /// For SoftRecovery: allows 25% of traffic through (1 in SOFT_RECOVERY_TRAFFIC_RATIO=4).
     /// For CircuitOpen: force-resets after max_open_duration with jitter.
+    /// When `config.enabled = false`, always returns `true` unconditionally.
     pub fn is_healthy(&self, proxy_addr: &str) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
         if let Some(mut state) = self.states.get_mut(proxy_addr) {
             match state.status {
                 ProxyStatus::CircuitOpen => {
@@ -337,7 +355,7 @@ impl ProxyHealthTracker {
                     false
                 }
                 ProxyStatus::SoftRecovery => {
-                    // Allow ~25% of traffic through during soft recovery.
+                    // Allow 25% of traffic through during soft recovery (1 in 4).
                     // Uses a global atomic counter for fairness across concurrent calls.
                     let count = self.soft_recovery_counter.fetch_add(1, Ordering::Relaxed);
                     count % SOFT_RECOVERY_TRAFFIC_RATIO == 0
@@ -352,9 +370,13 @@ impl ProxyHealthTracker {
 
     /// Record a connection failure. May trip the circuit breaker.
     ///
-    /// `failure_type` controls whether the circuit trips immediately (auth/protocol errors)
-    /// or uses the threshold-based approach (transient/network errors).
+    /// `failure_type` controls whether the circuit trips immediately (auth errors)
+    /// or uses the threshold-based approach (all other types).
+    /// When `config.enabled = false`, this is a no-op.
     pub fn record_failure(&self, proxy_addr: &str, error: &str, failure_type: FailureType) {
+        if !self.config.enabled {
+            return;
+        }
         let mut entry = self.states.entry(proxy_addr.to_string()).or_insert_with(ProxyState::new);
         let state = entry.value_mut();
 
@@ -363,7 +385,7 @@ impl ProxyHealthTracker {
                 // FIX 4: Time-window deduplication — ignore rapid-fire failures.
                 // A single tunnel blip can produce many UDP errors within milliseconds.
                 // Only count failures separated by FAILURE_DEDUP_WINDOW (1s).
-                // Auth/protocol errors bypass dedup since they indicate real config issues.
+                // Auth errors (immediate trip) bypass dedup since they indicate real config issues.
                 if !failure_type.is_immediate_trip() {
                     if let Some(last_fail) = state.last_failure {
                         if last_fail.elapsed() < FAILURE_DEDUP_WINDOW {
@@ -383,7 +405,8 @@ impl ProxyHealthTracker {
                 state.last_failure = Some(Instant::now());
                 state.last_error = Some(error.to_string());
 
-                // Auth/protocol errors trip immediately — retrying won't fix misconfiguration
+                // Auth errors trip immediately — retrying a bad password won't fix misconfiguration.
+                // All other types (ProtocolError, Transient, NetworkError) use the threshold.
                 let should_trip = if failure_type.is_immediate_trip() {
                     warn!(
                         "Proxy {} {:?} failure — immediate circuit trip: {}",
@@ -535,7 +558,11 @@ impl ProxyHealthTracker {
     /// In SoftRecovery: counts successes toward full recovery.
     /// In CircuitOpen/HalfOpen: transitions to SoftRecovery (not directly to Healthy).
     /// In Degraded: resets to Healthy immediately.
+    /// When `config.enabled = false`, this is a no-op.
     pub fn record_success(&self, proxy_addr: &str) {
+        if !self.config.enabled {
+            return;
+        }
         let mut entry = self.states.entry(proxy_addr.to_string()).or_insert_with(ProxyState::new);
         let state = entry.value_mut();
 
@@ -707,6 +734,11 @@ impl ProxyHealthTracker {
     ///
     /// This function runs forever and should be spawned as a background task.
     pub async fn run_health_probes(&self) {
+        if !self.config.enabled {
+            info!("Proxy health probe task: circuit breaker DISABLED — health probes will not run");
+            return;
+        }
+
         info!("Proxy health probe task started (interval={}s, probe_timeout={}s, max_open={}s, \
                max_backoff={}x, jitter={}%)",
               self.config.probe_interval.as_secs(),

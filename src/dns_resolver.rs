@@ -112,16 +112,26 @@ impl Default for DnsResolverConfig {
 }
 
 /// Extract the hostname from a DoH URL.
-/// E.g. "https://dns.google/dns-query" → "dns.google"
-///      "https://example.com:8443/path" → "example.com"
+/// E.g. "https://dns.google/dns-query"       → "dns.google"
+///      "https://example.com:8443/path"       → "example.com"
+///      "https://[2001:db8::1]/dns-query"     → "2001:db8::1"
+///      "https://[2001:db8::1]:8443/dns-query"→ "2001:db8::1"
 fn extract_doh_hostname(url: &str) -> Option<String> {
     let without_scheme = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
     // Take everything up to the first '/' (path separator)
     let host_and_port = without_scheme.split('/').next()?;
-    // Strip the port if present
-    let hostname = host_and_port.split(':').next()?;
+
+    let hostname = if host_and_port.starts_with('[') {
+        // IPv6 literal in brackets: [addr] or [addr]:port
+        let end = host_and_port.find(']')?;
+        &host_and_port[1..end]
+    } else {
+        // IPv4 or domain name, may have :port suffix
+        host_and_port.split(':').next()?
+    };
+
     if hostname.is_empty() {
         None
     } else {

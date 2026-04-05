@@ -7,7 +7,8 @@ set -euo pipefail
 
 LAN_ADDR="192.168.1.10"           # IP самого прокси-сервера в LAN
 TPROXY_ADDR="0.0.0.0"           # куда TPROXY отправляет (обычно тот же IP)
-TPROXY_PORT="1080"                # порт socks/http proxy (dante, 3proxy, shadowsocks и т.п.)
+TPROXY_TCP_PORT="1080"            # порт TCP-листенера cheburproxy (config: port)
+TPROXY_UDP_PORT="1081"            # порт UDP-листенера cheburproxy (config: udp_port, default = port + 1)
 
 LAN_IFACE="eno1"                  # интерфейс локальной сети (откуда приходят клиенты)
 OVPN_IFACE="tun0"                 # интерфейс OpenVPN (если есть)
@@ -107,8 +108,8 @@ iptables -t mangle -A TPROXY_CHAIN -p udp -m socket --transparent -j MARK --set-
 iptables -t mangle -A TPROXY_CHAIN -m socket                -j RETURN
 
 # 4. Сам TPROXY — только выбранные порты (HTTP/HTTPS + мессенджеры)
-iptables -t mangle -A TPROXY_CHAIN -p tcp -m multiport --dports "$PORTS_TCP" -j TPROXY --on-port "$TPROXY_PORT" --on-ip "$TPROXY_ADDR" --tproxy-mark 0x1
-iptables -t mangle -A TPROXY_CHAIN -p udp -m multiport --dports "$PORTS_UDP" -j TPROXY --on-port "$TPROXY_PORT" --on-ip "$TPROXY_ADDR" --tproxy-mark 0x2
+iptables -t mangle -A TPROXY_CHAIN -p tcp -m multiport --dports "$PORTS_TCP" -j TPROXY --on-port "$TPROXY_TCP_PORT" --on-ip "$TPROXY_ADDR" --tproxy-mark 0x1
+iptables -t mangle -A TPROXY_CHAIN -p udp -m multiport --dports "$PORTS_UDP" -j TPROXY --on-port "$TPROXY_UDP_PORT" --on-ip "$TPROXY_ADDR" --tproxy-mark 0x2
 
 # Привязываем только к LAN-интерфейсу (важно при VPN!)
 iptables -t mangle -A PREROUTING -i "$LAN_IFACE" -j TPROXY_CHAIN
@@ -152,4 +153,4 @@ iptables -t mangle -A OUTPUT -j TPROXY_MARK
 
 echo "[*] Готово! Правила загружены."
 echo "Проверь: iptables -t mangle -nvL | grep -C2 TPROXY"
-echo "         ss -ltnp | grep :$TPROXY_PORT"
+echo "         ss -ltnp | grep -E ':($TPROXY_TCP_PORT|$TPROXY_UDP_PORT)'"

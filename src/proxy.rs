@@ -13,10 +13,15 @@ use lazy_static::lazy_static;
 use dashmap::DashMap;
 use std::hash::{Hash, Hasher};
 
+// How often to emit a WARN log about fast-failing for the same proxy (seconds).
+// Between these intervals the first fast-fail is logged, the rest are suppressed
+// with a summary count emitted on the next interval boundary.
+const FAST_FAIL_LOG_INTERVAL_SECS: u64 = 10;
+
 // Constants for better maintainability
 const CONNECTION_POOL_TIMEOUT_SECS: u64 = 60;
 const PEEK_TIMEOUT_SECS: u64 = 10;
-const PEEK_BUFFER_SIZE: usize = 4096;
+const PEEK_BUFFER_SIZE: usize = 8192;
 // Maximum connection lifetime (hard limit to prevent stalled connections)
 const MAX_CONNECTION_LIFETIME_SECS: u64 = 3600; // 1 hour
 const MAX_CONNECTION_POOL_SIZE: usize = 10;
@@ -75,6 +80,10 @@ lazy_static! {
     pub static ref PER_PROXY_LIMITS: DashMap<ProxyKey, Arc<Semaphore>> = DashMap::new();
     /// Configured maximum connections per proxy.
     pub static ref PER_PROXY_MAX_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
+    /// Rate-limiting state for fast-fail WARN logs: proxy_addr → (last_warn_time, suppressed_count).
+    /// First fast-fail in each FAST_FAIL_LOG_INTERVAL_SECS window is logged at WARN;
+    /// subsequent ones are counted and a summary is emitted at the next interval boundary.
+    static ref FAST_FAIL_LOG_STATE: DashMap<String, (Instant, u64)> = DashMap::new();
 }
 
 pub fn get_proxy_key(proxy: &Proxy) -> ProxyKey {
@@ -176,6 +185,9 @@ pub enum ProxyError {
 
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
+
+    #[error("Target {target} unreachable via proxy: SOCKS5 reply code {reply_code:#04x}")]
+    TargetUnreachable { target: String, reply_code: u8 },
 
     #[error("Generic error: {message}")]
     GenericError { message: String },
@@ -319,7 +331,7 @@ async fn send_connect_request(stream: &mut TcpStream, target_host: &str, target_
     Ok(())
 }
 
-async fn read_connect_response(stream: &mut TcpStream) -> Result<()> {
+async fn read_connect_response(stream: &mut TcpStream, target_host: &str, target_port: u16) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
     let mut resp_buf = [0u8; 4];
@@ -332,9 +344,19 @@ async fn read_connect_response(stream: &mut TcpStream) -> Result<()> {
     }
 
     if resp_buf[1] != 0 {
-        return Err(ProxyError::Socks5Error {
-            message: format!("SOCKS5 CONNECT failed with code: {}", resp_buf[1])
-        });
+        let reply_code = resp_buf[1];
+        let target = format_target(target_host, target_port);
+        return match reply_code {
+            // 0x03 Network unreachable, 0x04 Host unreachable,
+            // 0x05 Connection refused, 0x06 TTL expired — target issues, NOT proxy failures
+            0x03 | 0x04 | 0x05 | 0x06 => Err(ProxyError::TargetUnreachable { target, reply_code }),
+            // 0x02 Connection not allowed by ruleset — policy issue, not a proxy health problem
+            0x02 => Err(ProxyError::TargetUnreachable { target, reply_code }),
+            // 0x01 General failure, 0x07 Command not supported, 0x08 Address type not supported — proxy issues
+            _ => Err(ProxyError::Socks5Error {
+                message: format!("SOCKS5 CONNECT to {} failed with reply code {:#04x}", target, reply_code)
+            }),
+        };
     }
 
     let atyp = resp_buf[3];
@@ -377,7 +399,7 @@ async fn perform_socks5_handshake(stream: &mut TcpStream, proxy: &Proxy, target_
     send_connect_request(stream, target_host, target_port).await?;
 
     // Read CONNECT response
-    read_connect_response(stream).await?;
+    read_connect_response(stream, target_host, target_port).await?;
 
     Ok(())
 }
@@ -447,10 +469,46 @@ async fn get_pooled_proxy_stream(proxy: &Proxy, target_host: &str, target_port: 
 
     // 3. Circuit breaker check (fast-fail)
     if !crate::proxy_health::is_healthy(&proxy_addr) {
-        warn!(
-            "Proxy {} (tag: {}) unavailable (circuit breaker open), fast-failing for {}",
-            proxy_addr, proxy.tag, format_target(target_host, target_port)
-        );
+        // Rate-limit WARN logs: emit the first fast-fail immediately, then suppress
+        // subsequent ones for FAST_FAIL_LOG_INTERVAL_SECS, logging a count summary
+        // at the next interval boundary to avoid log flooding under high traffic.
+        let log_interval = Duration::from_secs(FAST_FAIL_LOG_INTERVAL_SECS);
+        let mut entry = FAST_FAIL_LOG_STATE
+            .entry(proxy_addr.clone())
+            // Initialise with a timestamp far enough in the past so the first fast-fail
+            // is always logged immediately. checked_sub falls back to UNIX_EPOCH-equivalent
+            // on overflow (shouldn't happen with 11s offset from a running process).
+            .or_insert_with(|| {
+                let past = Instant::now()
+                    .checked_sub(log_interval + Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now);
+                (past, 0)
+            });
+        let (last_warn, suppressed) = entry.value_mut();
+        if last_warn.elapsed() >= log_interval {
+            if *suppressed > 0 {
+                warn!(
+                    "Proxy {} (tag: {}) unavailable (circuit breaker open), fast-failing \
+                     ({} connections suppressed in last {}s, current: {})",
+                    proxy_addr, proxy.tag, suppressed, FAST_FAIL_LOG_INTERVAL_SECS,
+                    format_target(target_host, target_port)
+                );
+            } else {
+                warn!(
+                    "Proxy {} (tag: {}) unavailable (circuit breaker open), fast-failing for {}",
+                    proxy_addr, proxy.tag, format_target(target_host, target_port)
+                );
+            }
+            *last_warn = Instant::now();
+            *suppressed = 0;
+        } else {
+            *suppressed += 1;
+            debug!(
+                "Proxy {} (tag: {}) unavailable (circuit breaker open), fast-failing for {} \
+                 (log suppressed, {} in window)",
+                proxy_addr, proxy.tag, format_target(target_host, target_port), suppressed
+            );
+        }
         return Err(ProxyError::ProxyUnavailable { addr: proxy_addr });
     }
 
@@ -476,14 +534,30 @@ async fn get_pooled_proxy_stream(proxy: &Proxy, target_host: &str, target_port: 
         }
     };
 
-    match perform_socks5_handshake(&mut stream, proxy, target_host, target_port, upstream_proxy_timeout).await {
-        Ok(()) => {
+    match timeout(upstream_proxy_timeout, perform_socks5_handshake(&mut stream, proxy, target_host, target_port, upstream_proxy_timeout)).await {
+        Ok(Ok(())) => {
             proxy_health::record_success(&proxy_addr);
             Ok((stream, permit))
         }
-        Err(e) => {
-            proxy_health::record_failure(&proxy_addr, &e);
+        Ok(Err(e)) => {
+            // Don't penalize proxy health when the TARGET is unreachable —
+            // the proxy itself is working fine, it correctly reported the target can't be reached.
+            match &e {
+                ProxyError::TargetUnreachable { .. } => {
+                    proxy_health::record_success(&proxy_addr);
+                    debug!("Proxy {} working but target unreachable: {}", proxy_addr, e);
+                }
+                _ => {
+                    proxy_health::record_failure(&proxy_addr, &e);
+                }
+            }
             Err(e)
+        }
+        Err(_) => {
+            let msg = format!("SOCKS5 handshake timeout ({}s) to {}", upstream_proxy_timeout.as_secs(), proxy_addr);
+            proxy_health::record_failure(&proxy_addr, &msg);
+            warn!("Proxy {} SOCKS5 handshake timeout", proxy_addr);
+            Err(ProxyError::ConnectionTimeout { duration: upstream_proxy_timeout })
         }
     }
 }
@@ -569,7 +643,17 @@ async fn gather_connection_info(
             0 // treat as empty peek — will fall through to IP-based routing
         }
     };
-    let sni = if n > 0 { extract_sni(&peek_buf[..n])? } else { None };
+    let sni = if n > 0 {
+        match extract_sni(&peek_buf[..n]) {
+            Ok(sni) => sni,
+            Err(e) => {
+                debug!("SNI extraction failed for {}: {}, continuing without SNI", original_dst, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let is_tls = n > 0 && peek_buf[0] == 0x16;
 
     // Use SNI immediately for HTTPS if available, skip reverse DNS to speed up 80% traffic
@@ -819,9 +903,17 @@ async fn forward(a: TcpStream, b: TcpStream, _permit: Option<OwnedSemaphorePermi
     }
 }
 
-pub async fn handle_socks5_handshake(stream: &mut tokio::net::TcpStream) -> anyhow::Result<(SocketAddr, Option<String>)> {
+/// Handle an inbound SOCKS5 handshake on `stream`.
+///
+/// Domain-name CONNECT requests (ATYP=0x03) are resolved through
+/// `dns_resolver` (the shared `InternalDnsResolver`) so that all DNS
+/// traffic goes through the configured protocol (DoH/DoT/SOCKS5) rather
+/// than leaking as plain UDP to hardcoded upstream servers.
+pub async fn handle_socks5_handshake(
+    stream: &mut tokio::net::TcpStream,
+    dns_resolver: &crate::dns_resolver::InternalDnsResolver,
+) -> anyhow::Result<(SocketAddr, Option<String>)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use crate::dns_pool::DNS_POOL;
 
     let mut buf = [0u8; 256];
 
@@ -859,14 +951,15 @@ pub async fn handle_socks5_handshake(stream: &mut tokio::net::TcpStream) -> anyh
             stream.read_exact(&mut buf[..len + 2]).await?;
             let domain = std::string::String::from_utf8_lossy(&buf[..len]).to_string();
             let port = ((buf[len] as u16) << 8) | buf[len + 1] as u16;
-            let resolver = DNS_POOL.get_resolver().await;
-            let response = timeout(
+            // Resolve through InternalDnsResolver (DoH/DoT/SOCKS5 per config),
+            // not through the legacy plain-UDP pool.
+            let ip_addr = timeout(
                 Duration::from_secs(10),
-                resolver.lookup_ip(domain.clone()),
+                dns_resolver.resolve_first(&domain),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("DNS lookup timed out for domain: {}", domain))??;
-            let ip_addr = response.iter().next().ok_or(anyhow::anyhow!("No IP found for domain"))?;
+            .map_err(|_| anyhow::anyhow!("DNS lookup timed out for domain: {}", domain))?
+            .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}: {}", domain, e))?;
             let target_addr = SocketAddr::new(ip_addr, port);
             (target_addr, Some(domain))
         }
