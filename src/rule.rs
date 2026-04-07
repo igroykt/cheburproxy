@@ -1000,8 +1000,10 @@ impl RuleEngine {
             completed: false,
         };
 
-        // overall deadline for the whole operation
-        let deadline = TokioInstant::now() + self.config.availability_check_timeout;
+        // Overall deadline: use the smaller of the legacy availability_check_timeout and
+        // the V2 overall_budget so that both config paths are respected.
+        let deadline = TokioInstant::now() + self.config.availability_check_timeout
+            .min(self.config.availability_config.overall_budget);
 
         // bounded concurrency (DoS safety)
         let permit = match tokio::time::timeout_at(deadline, self.availability_sem.acquire()).await {
@@ -1031,6 +1033,48 @@ impl RuleEngine {
                 let _ = w.send(value);
             }
         }
+    }
+
+    /// Check whether the availability cache currently holds a positive (available=true)
+    /// non-expired entry for this domain:port.
+    ///
+    /// Used at idle-kill time to distinguish Direct connections that were routed by
+    /// `availability_check` (cache will have a live positive entry) from those routed
+    /// by explicit domain/geosite/geoip rules (cache will have no entry, because
+    /// `check_availability()` is only called when all rule passes return None).
+    ///
+    /// This lets the idle-kill handler call `mark_unavailable_in_cache()` only when
+    /// the stall is likely caused by DPI (availability_check said "available" but
+    /// sub-resources hang), and stay silent for explicit-rule Direct connections
+    /// (e.g. `dns.google`, `nel.heroku.com`) whose idle is natural, not DPI.
+    pub fn has_positive_availability_entry(&self, domain: &str, port: u16) -> bool {
+        let key = format!("{}:{}", domain, port);
+        self.availability_cache
+            .get(&key)
+            .map(|entry| entry.0 && entry.1.elapsed() < Duration::from_secs(entry.2))
+            .unwrap_or(false)
+    }
+
+    /// Insert a negative (unavailable) result into the availability cache.
+    ///
+    /// Called when a Direct connection is idle-killed — the availability probe passes
+    /// (DPI allows the initial GET /) but real browser traffic stalls. Simply evicting
+    /// the cache would cause an immediate re-probe that returns "Available" again,
+    /// creating an infinite loop: Direct → stall → evict → re-probe → Available → Direct.
+    ///
+    /// Instead, inserting `false` with the standard TTL (availability_cache_ttl, default
+    /// 300s) makes `check_availability()` return `false` immediately, routing the next
+    /// connection via proxy. After the TTL expires a fresh probe is run; if DPI has been
+    /// lifted the domain goes Direct again, otherwise the next idle-kill re-inserts
+    /// the negative entry — a self-correcting feedback loop with no thrashing.
+    pub fn mark_unavailable_in_cache(&self, domain: &str, port: u16) {
+        let key = format!("{}:{}", domain, port);
+        let ttl = self.config.availability_cache_ttl;
+        self.availability_cache.insert(key.clone(), (false, Instant::now(), ttl));
+        debug!(
+            "Availability cache force-negative for '{}' (idle-kill feedback, TTL={}s)",
+            key, ttl
+        );
     }
 
     /// Resolve domain to IP with caching, preferring IPv4 over IPv6

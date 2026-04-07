@@ -3,9 +3,10 @@ use crate::sni::extract_sni;
 use crate::router::Proxy;
 use crate::proxy_health;
 use crate::transparent::connect_tcp_with_mark;
-use tokio::{net::TcpStream, time::{timeout, Duration}, io::AsyncWriteExt, sync::{OwnedSemaphorePermit, Semaphore}};
+use tokio::{net::TcpStream, time::{timeout, Duration}, io::{AsyncReadExt, AsyncWriteExt}, sync::{OwnedSemaphorePermit, Semaphore}};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::time::Instant;
 use log::{debug, info, warn};
@@ -24,14 +25,15 @@ const PEEK_TIMEOUT_SECS: u64 = 10;
 const PEEK_BUFFER_SIZE: usize = 8192;
 // Maximum connection lifetime (hard limit to prevent stalled connections)
 const MAX_CONNECTION_LIFETIME_SECS: u64 = 3600; // 1 hour
+// Default idle timeout: kill connections where no data flows in either direction.
+// This catches DPI-stalled HTTP/2 connections that hold TCP open but stop forwarding frames.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 const MAX_CONNECTION_POOL_SIZE: usize = 10;
 // TCP keepalive settings for pooled proxy connections:
 // Detect dead connections proactively instead of waiting until use.
 const TCP_KEEPALIVE_TIME_SECS: u64 = 30;      // Time before first keepalive probe
 const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 10;  // Interval between probes
 const TCP_KEEPALIVE_RETRIES: u32 = 3;         // Max failed probes before connection is dead
-// Number of connections to pre-establish when a proxy recovers
-const POOL_WARMUP_SIZE: usize = 3;
 const SOCKS5_VERSION: u8 = 5;
 const SOCKS5_CONNECT_CMD: u8 = 1;
 const SOCKS5_NO_AUTH: u8 = 0;
@@ -701,6 +703,7 @@ pub async fn handle_tcp_stream(
     upstream_proxy_timeout: Duration,
     context_enabled: bool,
     context_ttl: Duration,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let client_addr = inbound.peer_addr().ok();
     let client_label = client_addr
@@ -720,7 +723,7 @@ pub async fn handle_tcp_stream(
     if original_dst.port() == 53 || original_dst.port() == 853 {
         debug!("DNS port detected ({}), using direct connection", original_dst.port());
         let out = connect_tcp_with_mark(original_dst).await?;
-        return forward(inbound, out, None).await;
+        return forward(inbound, out, None, idle_timeout).await.map(|_| ());
     }
 
     // ── Routing decision ─────────────────────────────────────────────────
@@ -800,12 +803,39 @@ pub async fn handle_tcp_stream(
                 }
             }
 
-            forward(inbound, out, Some(permit)).await
+            forward(inbound, out, Some(permit), idle_timeout).await.map(|_| ())
         }
         Some(RoutingDecision::Direct) | None => {
             debug!("Direct connection to {} for '{}'", original_dst, connection_info.routing_domain);
             let out = connect_tcp_with_mark(original_dst).await?;
-            forward(inbound, out, None).await
+            match forward(inbound, out, None, idle_timeout).await? {
+                ForwardResult::IdleTimeout => {
+                    let tld = crate::client_context::get_top_level_domain(&connection_info.routing_domain);
+                    let port = original_dst.port();
+                    // Only act if the Direct decision came from availability_check.
+                    // check_availability() always inserts its result into the cache;
+                    // explicit domain/geosite/geoip rules never touch it.
+                    // So a live positive cache entry means this was an availability_check
+                    // Direct — the stall is likely DPI. No entry means explicit rule —
+                    // idle is natural (e.g. dns.google, nel.heroku.com) and no action needed.
+                    if rules.has_positive_availability_entry(&tld, port) {
+                        warn!(
+                            "Direct connection to '{}' (TLD: '{}') idle-killed after {}s, \
+                             forcing proxy routing (availability_check override)",
+                            connection_info.routing_domain, tld, idle_timeout.as_secs()
+                        );
+                        rules.mark_unavailable_in_cache(&tld, port);
+                    } else {
+                        debug!(
+                            "Direct connection to '{}' idle-killed after {}s \
+                             (explicit rule, no availability cache action)",
+                            connection_info.routing_domain, idle_timeout.as_secs()
+                        );
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
         }
     }
 }
@@ -824,23 +854,62 @@ pub fn is_data_plane_error(err: &std::io::Error) -> bool {
     )
 }
 
-async fn forward(a: TcpStream, b: TcpStream, _permit: Option<OwnedSemaphorePermit>) -> Result<()> {
+/// Return value from `forward()` indicating why forwarding ended.
+#[derive(Debug)]
+pub enum ForwardResult {
+    /// Both directions completed normally (EOF / peer FIN).
+    Completed,
+    /// No data moved in either direction for `idle_timeout` seconds.
+    /// The caller should invalidate any cached Direct routing decision so the
+    /// next connection re-evaluates availability (the site may be DPI-blocked).
+    IdleTimeout,
+    /// Hard 1-hour lifetime expired.
+    LifetimeExpired,
+}
+
+/// Copy bytes from `reader` to `writer`, setting `activity` to true on every chunk.
+/// Returns the total number of bytes forwarded.
+async fn copy_with_activity(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    activity: Arc<AtomicBool>,
+) -> std::io::Result<u64> {
+    let mut buf = vec![0u8; 8192];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n]).await?;
+        total += n as u64;
+        activity.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn forward(
+    a: TcpStream,
+    b: TcpStream,
+    _permit: Option<OwnedSemaphorePermit>,
+    idle_timeout: Duration,
+) -> Result<ForwardResult> {
     let (mut ar, mut aw) = a.into_split();
     let (mut br, mut bw) = b.into_split();
 
-    // Spawn copy tasks with explicit shutdown(Write) for proper half-close
+    // Shared activity flag: either copy direction sets it; the idle watchdog clears it.
+    let activity = Arc::new(AtomicBool::new(true));
+
+    let act_a = activity.clone();
+    let act_b = activity.clone();
+
+    // Spawn bidirectional copy tasks that signal data flow via the activity flag.
     let a_to_b = tokio::spawn(async move {
-        let res = tokio::io::copy(&mut ar, &mut bw).await;
-        // Explicitly shutdown write half to send FIN to peer
-        let _ = bw.shutdown().await;
-        res
+        copy_with_activity(&mut ar, &mut bw, act_a).await
     });
 
     let b_to_a = tokio::spawn(async move {
-        let res = tokio::io::copy(&mut br, &mut aw).await;
-        // Explicitly shutdown write half to send FIN to peer
-        let _ = aw.shutdown().await;
-        res
+        copy_with_activity(&mut br, &mut aw, act_b).await
     });
 
     // P0-1 FIX: Obtain AbortHandles BEFORE moving JoinHandles into select!.
@@ -850,6 +919,28 @@ async fn forward(a: TcpStream, b: TcpStream, _permit: Option<OwnedSemaphorePermi
     let a_abort = a_to_b.abort_handle();
     let b_abort = b_to_a.abort_handle();
     let max_lifetime = Duration::from_secs(MAX_CONNECTION_LIFETIME_SECS);
+
+    // Idle watchdog: checks every `idle_timeout` seconds whether any data has moved
+    // in either direction.  Activity flag is reset after each check; if it's still
+    // false on the next check the connection is considered stalled and gets killed.
+    // Disabled when idle_timeout is zero.
+    let idle_check = {
+        let act = activity.clone();
+        async move {
+            if idle_timeout.is_zero() {
+                // Idle timeout disabled — sleep forever (select! arm never fires).
+                std::future::pending::<()>().await;
+            } else {
+                loop {
+                    tokio::time::sleep(idle_timeout).await;
+                    if !act.swap(false, Ordering::Relaxed) {
+                        // No data in the last period — connection is stalled.
+                        break;
+                    }
+                }
+            }
+        }
+    };
 
     tokio::select! {
         (r1, r2) = async { tokio::join!(a_to_b, b_to_a) } => {
@@ -868,11 +959,11 @@ async fn forward(a: TcpStream, b: TcpStream, _permit: Option<OwnedSemaphorePermi
             // Classify errors: data-plane errors (ECONNRESET, EPIPE) are normal and swallowed.
             // Only real infrastructure errors are propagated.
             match (err1, err2) {
-                (None, None) => Ok(()),
+                (None, None) => Ok(ForwardResult::Completed),
                 (Some(e), None) | (None, Some(e)) => {
                     if is_data_plane_error(&e) {
                         debug!("Stream forwarding ended (peer disconnect): {}", e);
-                        Ok(())
+                        Ok(ForwardResult::Completed)
                     } else {
                         Err(ProxyError::IoError(e))
                     }
@@ -883,13 +974,19 @@ async fn forward(a: TcpStream, b: TcpStream, _permit: Option<OwnedSemaphorePermi
                     match (e1_data, e2_data) {
                         (true, true) => {
                             debug!("Stream forwarding ended (both sides disconnected): {} / {}", e1, e2);
-                            Ok(())
+                            Ok(ForwardResult::Completed)
                         }
                         (false, _) => Err(ProxyError::IoError(e1)),
                         (_, false) => Err(ProxyError::IoError(e2)),
                     }
                 }
             }
+        }
+        _ = idle_check => {
+            a_abort.abort();
+            b_abort.abort();
+            debug!("Connection idle for {}s with no data, tasks aborted", idle_timeout.as_secs());
+            Ok(ForwardResult::IdleTimeout)
         }
         _ = tokio::time::sleep(max_lifetime) => {
             // P0-1 FIX: Explicitly abort both spawned tasks via AbortHandle to prevent zombie task leak.
@@ -898,7 +995,7 @@ async fn forward(a: TcpStream, b: TcpStream, _permit: Option<OwnedSemaphorePermi
             a_abort.abort();
             b_abort.abort();
             debug!("Connection exceeded max lifetime ({}s), tasks aborted", MAX_CONNECTION_LIFETIME_SECS);
-            Ok(())
+            Ok(ForwardResult::LifetimeExpired)
         }
     }
 }
@@ -998,66 +1095,6 @@ pub fn configure_tcp_keepalive(
     sock_ref.set_tcp_keepalive(&keepalive)
 }
 
-/// Pre-establish connections to a proxy when it recovers from a circuit breaker trip.
-///
-/// When a proxy recovers, the connection pool is empty. The first wave of user
-/// connections all need fresh SOCKS5 handshakes (~200-500ms each), causing a visible
-/// latency spike. This function pre-warms the pool by establishing POOL_WARMUP_SIZE
-/// TCP connections to the proxy.
-///
-/// NOTE: Only TCP connections are pre-established (no SOCKS5 handshake), since we don't
-/// know which target hosts will be requested. The SOCKS5 handshake is target-specific.
-pub async fn warmup_connection_pool(proxy: &Proxy, upstream_proxy_timeout: Duration) {
-    let proxy_addr = format!("{}:{}", proxy.server_addr, proxy.server_port);
-    let key = ProxyKey {
-        addr: proxy.server_addr.clone(),
-        port: proxy.server_port,
-        tag: proxy.tag.clone(),
-    };
-
-    info!(
-        "Pool warmup: pre-establishing {} connections to recovered proxy {} (tag: {})",
-        POOL_WARMUP_SIZE, proxy_addr, proxy.tag
-    );
-
-    let mut established = 0usize;
-    for i in 0..POOL_WARMUP_SIZE {
-        // Only warm up if we can get a permit
-        let permit = match acquire_proxy_permit(&key) {
-            Ok(p) => p,
-            Err(_) => {
-                debug!("Pool warmup: skipping connection {} for {} - limit reached", i, proxy_addr);
-                break;
-            }
-        };
-
-        match timeout(upstream_proxy_timeout, connect_tcp_with_mark((&*proxy.server_addr, proxy.server_port))).await {
-            Ok(Ok(stream)) => {
-                if let Err(e) = configure_tcp_keepalive(&stream, None, None, None) {
-                    debug!("Pool warmup: failed to set keepalive on connection {}: {}", i, e);
-                }
-                CONNECTION_POOL.entry(key.clone()).or_insert_with(Vec::new)
-                    .push((stream, Instant::now(), permit));
-                established += 1;
-            }
-            Ok(Err(e)) => {
-                debug!("Pool warmup: connection {} to {} failed: {}", i, proxy_addr, e);
-                break; // Don't keep trying if one fails
-            }
-            Err(_) => {
-                debug!("Pool warmup: connection {} to {} timed out", i, proxy_addr);
-                break;
-            }
-        }
-    }
-
-    if established > 0 {
-        info!(
-            "Pool warmup: established {}/{} connections to proxy {} (tag: {})",
-            established, POOL_WARMUP_SIZE, proxy_addr, proxy.tag
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -643,6 +643,15 @@ async fn main() -> anyhow::Result<()> {
         .map(|secs| Duration::from_secs(secs as u64))
         .unwrap_or(Duration::from_secs(10));
 
+    // Idle timeout: kill connections where no data flows in either direction.
+    // Catches DPI-stalled HTTP/2 connections that hold TCP open but stop forwarding.
+    // Set to 0 to disable.
+    let connection_idle_timeout = parsed.get("client")
+        .and_then(|client| client.get("connection_idle_timeout"))
+        .and_then(|v| v.as_integer())
+        .map(|secs| Duration::from_secs(secs as u64))
+        .unwrap_or(Duration::from_secs(crate::proxy::DEFAULT_IDLE_TIMEOUT_SECS));
+
     let tcp_keepalive_time = parsed.get("client")
         .and_then(|c| c.get("tcp_keepalive_time"))
         .and_then(|v| v.as_integer())
@@ -1432,7 +1441,7 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             debug!("Final domain for routing: {:?}", optional_domain);
-                            if let Err(e) = handle_tcp_stream(stream, dst, engine, optional_domain, upstream_proxy_timeout, context_enabled, Duration::from_secs(context_ttl)).await {
+                            if let Err(e) = handle_tcp_stream(stream, dst, engine, optional_domain, upstream_proxy_timeout, context_enabled, Duration::from_secs(context_ttl), connection_idle_timeout).await {
                                 match &e {
                                     crate::proxy::ProxyError::IoError(io_err) if crate::proxy::is_data_plane_error(io_err) => {
                                         debug!("Connection to {} closed (peer disconnect): {}", dst, io_err);
@@ -1547,7 +1556,7 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     };
-                    if let Err(e) = handle_tcp_stream(stream, dst, engine, domain, upstream_proxy_timeout, context_enabled, Duration::from_secs(context_ttl)).await {
+                    if let Err(e) = handle_tcp_stream(stream, dst, engine, domain, upstream_proxy_timeout, context_enabled, Duration::from_secs(context_ttl), connection_idle_timeout).await {
                         match &e {
                             crate::proxy::ProxyError::IoError(io_err) if crate::proxy::is_data_plane_error(io_err) => {
                                 debug!("Connection closed (peer disconnect): {}", io_err);

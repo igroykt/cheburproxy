@@ -81,6 +81,14 @@ dns_proxy_log_queries = false  # Set to true for debugging
 # Upstream proxy connection timeout in seconds (default: 10)
 upstream_proxy_timeout = 10
 
+# Idle connection timeout in seconds (default: 120, set to 0 to disable).
+# Kills TCP connections where no data flows in either direction for this duration.
+# This catches DPI-stalled HTTP/2 connections that keep TCP alive but stop
+# forwarding frames — causing browser sub-resources to hang in "pending" forever.
+# For Direct-routed connections an idle-kill also evicts the availability cache
+# so the next connection re-evaluates whether the site should go via proxy.
+connection_idle_timeout = 60
+
 # ============ Circuit Breaker Configuration ============
 # Monitors upstream proxy health and fast-fails connections when the proxy is
 # unreachable, instead of waiting for the full upstream_proxy_timeout on each
@@ -115,7 +123,7 @@ upstream_proxy_timeout = 10
 availability_check = true
 
 # Legacy availability check timeout (seconds) - used if V2 options not set
-availability_check_timeout = 5
+availability_check_timeout = 3
 
 # Availability Check V2 - Granular Timeouts (milliseconds)
 # If any of these are set, V2 mode is used with HTTP GET + body validation

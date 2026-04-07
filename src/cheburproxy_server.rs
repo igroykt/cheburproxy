@@ -475,27 +475,69 @@ fn is_data_plane_error(err: &io::Error) -> bool {
     )
 }
 
+/// Default idle timeout for server-side connections (seconds).
+/// Matches the client-side default. Set to 0 to disable.
+const DEFAULT_SERVER_IDLE_TIMEOUT_SECS: u64 = 120;
+
+/// Copy bytes from `reader` to `writer`, setting `activity` on every chunk.
+async fn copy_with_activity_server(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    activity: Arc<AtomicBool>,
+) -> io::Result<u64> {
+    let mut buf = vec![0u8; TCP_BUFFER_SIZE];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n]).await?;
+        total += n as u64;
+        activity.store(true, Ordering::Relaxed);
+    }
+}
+
 async fn forward_streams(client: TcpStream, target: TcpStream) -> ProxyResult<()> {
+    forward_streams_with_idle(client, target, Duration::from_secs(DEFAULT_SERVER_IDLE_TIMEOUT_SECS)).await
+}
+
+async fn forward_streams_with_idle(client: TcpStream, target: TcpStream, idle_timeout: Duration) -> ProxyResult<()> {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut target_read, mut target_write) = target.into_split();
 
+    let activity = Arc::new(AtomicBool::new(true));
+    let act_c2t = activity.clone();
+    let act_t2c = activity.clone();
+
     let client_to_target = tokio::spawn(async move {
-        let result = tokio::io::copy(&mut client_read, &mut target_write).await;
-        // Explicitly shutdown write half to send FIN and prevent CLOSE_WAIT leak
-        let _ = target_write.shutdown().await;
-        result
+        copy_with_activity_server(&mut client_read, &mut target_write, act_c2t).await
     });
 
     let target_to_client = tokio::spawn(async move {
-        let result = tokio::io::copy(&mut target_read, &mut client_write).await;
-        // Explicitly shutdown write half to send FIN and prevent CLOSE_WAIT leak
-        let _ = client_write.shutdown().await;
-        result
+        copy_with_activity_server(&mut target_read, &mut client_write, act_t2c).await
     });
 
     let c2t_abort = client_to_target.abort_handle();
     let t2c_abort = target_to_client.abort_handle();
     let max_lifetime = Duration::from_secs(MAX_CONNECTION_LIFETIME_SECS);
+
+    let idle_check = {
+        let act = activity.clone();
+        async move {
+            if idle_timeout.is_zero() {
+                std::future::pending::<()>().await;
+            } else {
+                loop {
+                    tokio::time::sleep(idle_timeout).await;
+                    if !act.swap(false, Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            }
+        }
+    };
 
     tokio::select! {
         (c2t_result, t2c_result) = async { tokio::join!(client_to_target, target_to_client) } => {
@@ -534,6 +576,12 @@ async fn forward_streams(client: TcpStream, target: TcpStream) -> ProxyResult<()
                     }
                 }
             }
+        }
+        _ = idle_check => {
+            c2t_abort.abort();
+            t2c_abort.abort();
+            debug!("Server connection idle for {}s with no data, tasks aborted", idle_timeout.as_secs());
+            Ok(())
         }
         _ = tokio::time::sleep(max_lifetime) => {
             c2t_abort.abort();
