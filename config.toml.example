@@ -81,12 +81,23 @@ dns_proxy_log_queries = false  # Set to true for debugging
 # Upstream proxy connection timeout in seconds (default: 10)
 upstream_proxy_timeout = 10
 
-# Idle connection timeout in seconds (default: 120, set to 0 to disable).
-# Kills TCP connections where no data flows in either direction for this duration.
+# Initial idle timeout in seconds (default: 10).
+# Phase 1 of the two-phase idle watchdog. Applies immediately when a new
+# connection is established. If zero data flows in either direction during
+# this window the connection is killed — brand-new connections with no traffic
+# at all are almost certainly DPI-stalled (TLS handshake passed the availability
+# probe but real traffic is being blocked). After any data flows the connection
+# graduates to the lenient connection_idle_timeout (Phase 2).
+# Set to 0 to disable Phase 1 (Phase 2 still applies).
+connection_initial_idle_timeout = 10
+
+# Idle connection timeout in seconds (default: 120, set to 0 to disable both phases).
+# Phase 2 of the two-phase idle watchdog. Kills connections where no data flows
+# in either direction for this duration once the connection has proved active.
 # This catches DPI-stalled HTTP/2 connections that keep TCP alive but stop
-# forwarding frames — causing browser sub-resources to hang in "pending" forever.
-# For Direct-routed connections an idle-kill also evicts the availability cache
-# so the next connection re-evaluates whether the site should go via proxy.
+# forwarding frames after the initial burst.
+# For Direct-routed connections routed via availability_check, an idle-kill
+# inserts a negative cache entry so the next connection goes via proxy.
 connection_idle_timeout = 60
 
 # ============ Circuit Breaker Configuration ============

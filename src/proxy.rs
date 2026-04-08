@@ -28,6 +28,11 @@ const MAX_CONNECTION_LIFETIME_SECS: u64 = 3600; // 1 hour
 // Default idle timeout: kill connections where no data flows in either direction.
 // This catches DPI-stalled HTTP/2 connections that hold TCP open but stop forwarding frames.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+// Initial (Phase 1) idle timeout: aggressive short window immediately after connection start.
+// If zero data flows during this period the connection is almost certainly DPI-stalled
+// (DPI allowed the TLS handshake but is blocking actual traffic).  Once any data flows the
+// connection graduates to the lenient Phase 2 (DEFAULT_IDLE_TIMEOUT_SECS).
+pub const DEFAULT_INITIAL_IDLE_TIMEOUT_SECS: u64 = 10;
 const MAX_CONNECTION_POOL_SIZE: usize = 10;
 // TCP keepalive settings for pooled proxy connections:
 // Detect dead connections proactively instead of waiting until use.
@@ -703,6 +708,7 @@ pub async fn handle_tcp_stream(
     upstream_proxy_timeout: Duration,
     context_enabled: bool,
     context_ttl: Duration,
+    initial_idle_timeout: Duration,
     idle_timeout: Duration,
 ) -> Result<()> {
     let client_addr = inbound.peer_addr().ok();
@@ -723,35 +729,100 @@ pub async fn handle_tcp_stream(
     if original_dst.port() == 53 || original_dst.port() == 853 {
         debug!("DNS port detected ({}), using direct connection", original_dst.port());
         let out = connect_tcp_with_mark(original_dst).await?;
-        return forward(inbound, out, None, idle_timeout).await.map(|_| ());
+        return forward(inbound, out, None, initial_idle_timeout, idle_timeout).await.map(|_| ());
     }
 
     // ── Routing decision ─────────────────────────────────────────────────
+    //
+    // Three-stage priority order:
+    //
+    // Stage 1 — Explicit domain rules (highest priority, no cache involved).
+    //   Domains listed literally in any rule's `domains` array always win, even if a
+    //   stale context-cache entry says otherwise.  This ensures that adding/removing a
+    //   domain from router.json takes effect immediately after a SIGHUP reload without
+    //   waiting for the context TTL to expire.
+    //
+    // Stage 2 — Client context cache (performance shortcut for geosite/geoip domains).
+    //   Only consulted when Stage 1 returns no match.  The context cache stores the last
+    //   successful proxy tag for a (client_ip, TLD) pair and avoids repeating expensive
+    //   DNS + geoip lookups on every connection.
+    //
+    // Stage 3 — Full rule lookup (geosite, geoip, availability check).
+    //   Only reached when neither Stage 1 nor Stage 2 produced a decision.
+
     let mut context_proxy_tag = None;
-    if context_enabled && client_ip_str.is_some() {
+    let mut routing_decision = None;
+    let mut matched_tag = None;
+    // Tracks whether the decision came from an explicit domain pattern.
+    // If true we must NOT populate the context cache, since:
+    //   (a) the lookup is already O(rules) fast — no benefit from caching, and
+    //   (b) a cached proxy tag would re-introduce the stale-override problem on the
+    //       next connection even after the rule has been corrected.
+    let mut from_explicit_rule = false;
+
+    // ── Stage 1: Explicit domain rules ───────────────────────────────────
+    for domain in &connection_info.candidate_domains {
+        if let Some(dec) = rules.get_explicit_domain_decision(domain) {
+            routing_decision = Some(dec.clone());
+            if let RoutingDecision::Proxy(ref p) = dec {
+                matched_tag = Some(p.tag.clone());
+            }
+            from_explicit_rule = true;
+            debug!("Explicit rule match: domain='{}' -> decision={:?} (context cache bypassed)", domain, dec);
+            break;
+        }
+    }
+
+    // ── Stage 1.5: ECH fallback — reverse IP → explicit rule domain ──────
+    //
+    // When a browser uses Encrypted Client Hello (ECH), the visible TLS SNI is
+    // the Cloudflare outer name "cloudflare-ech.com" rather than the real domain.
+    // Stage 1 above finds no explicit-rule match for that name.
+    //
+    // Stage 1.5 looks up the destination IP in the pre-resolved ip_domain_map
+    // (built asynchronously at startup in main.rs). If the IP belongs to an
+    // explicit rule domain, that domain's routing decision is used — regardless
+    // of whether the client used the local DNS proxy or DoH.
+    //
+    // Note: this check is synchronous (DashMap lookup only), so it adds negligible
+    // latency.
+    if routing_decision.is_none() {
+        if let Some(mapped_domains) = rules.lookup_domains_by_ip(&original_dst.ip()) {
+            for domain in &mapped_domains {
+                if let Some(dec) = rules.get_explicit_domain_decision(domain) {
+                    routing_decision = Some(dec.clone());
+                    if let RoutingDecision::Proxy(ref p) = dec {
+                        matched_tag = Some(p.tag.clone());
+                    }
+                    from_explicit_rule = true;
+                    info!(
+                        "ECH IP-lookup: dst IP {} → explicit domain '{}' → {:?}",
+                        original_dst.ip(), domain, dec
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── Stage 2: Client context cache ────────────────────────────────────
+    if routing_decision.is_none() && context_enabled && client_ip_str.is_some() {
         let cip_str = client_ip_str.as_ref().unwrap();
         context_proxy_tag = crate::client_context::get_cached_proxy_tag(cip_str, &connection_info.routing_domain, context_ttl);
         if let Some(ref tag) = context_proxy_tag {
-            debug!("Context cache hit: forcing proxy tag '{}' for client IP '{}' and domain '{}'", tag, cip_str, connection_info.routing_domain);
+            debug!("Context cache hit: proxy tag '{}' for client IP '{}' and domain '{}'", tag, cip_str, connection_info.routing_domain);
+            if let Some(proxy) = rules.get_proxy_by_tag(tag) {
+                routing_decision = Some(RoutingDecision::Proxy(proxy.clone()));
+                matched_tag = Some(tag.clone());
+                debug!("Context priority: using cached proxy '{}' for client IP '{}', skipping full rule lookup", tag, client_ip_str.as_ref().unwrap());
+            } else {
+                debug!("Context cache contains invalid proxy tag '{}' for client IP '{}'", tag, client_ip_str.as_ref().unwrap());
+                context_proxy_tag = None;
+            }
         }
     }
 
-    let mut routing_decision = None;
-    let mut matched_tag = None;
-
-    // Context cache has highest priority.
-    if let Some(tag) = &context_proxy_tag {
-        if let Some(proxy) = rules.get_proxy_by_tag(tag) {
-            routing_decision = Some(RoutingDecision::Proxy(proxy.clone()));
-            matched_tag = Some(tag.clone());
-            debug!("Context priority: using cached proxy '{}' for client IP '{}', skipping rule lookup", tag, client_ip_str.as_ref().unwrap());
-        } else {
-            debug!("Context cache contains invalid proxy tag '{}' for client IP '{}'", tag, client_ip_str.as_ref().unwrap());
-            context_proxy_tag = None;
-        }
-    }
-
-    // Rule lookup.
+    // ── Stage 3: Full rule lookup (geosite / geoip / availability) ───────
     if routing_decision.is_none() {
         for domain in &connection_info.candidate_domains {
             debug!("Routing lookup: checking domain='{}'", domain);
@@ -796,33 +867,54 @@ pub async fn handle_tcp_stream(
             // Connect via proxy — no fallback to direct or other proxy.
             let (out, permit) = get_pooled_proxy_stream(&proxy, &connection_info.routing_domain, target_port, upstream_proxy_timeout).await?;
 
-            // Cache successful proxy decision.
-            if context_enabled && context_proxy_tag.is_none() {
+            // Cache successful proxy decision for geosite/geoip/availability-routed domains.
+            // Skip explicit-rule domains: they are fast to look up directly and must not
+            // be stored in the context cache (a stale entry would re-introduce the
+            // override problem that the three-stage routing order is designed to prevent).
+            if context_enabled && context_proxy_tag.is_none() && !from_explicit_rule {
                 if let Some(cip_str) = &client_ip_str {
                     crate::client_context::set_cached_proxy_tag(cip_str, &connection_info.routing_domain, &proxy.tag);
                 }
             }
 
-            forward(inbound, out, Some(permit), idle_timeout).await.map(|_| ())
+            forward(inbound, out, Some(permit), initial_idle_timeout, idle_timeout).await.map(|_| ())
         }
         Some(RoutingDecision::Direct) | None => {
-            debug!("Direct connection to {} for '{}'", original_dst, connection_info.routing_domain);
+            let tld = crate::client_context::get_top_level_domain(&connection_info.routing_domain);
+            let port = original_dst.port();
+
+            // availability_check-routed Direct connections are inherently uncertain —
+            // the probe only checks GET /, not real browser traffic.  DPI that allows
+            // the initial TLS + first HTTP response but blocks subsequent h2 frames will
+            // pass Phase 1 (data arrived in first 10s) and then stall.
+            //
+            // Use initial_idle_timeout for Phase 2 as well on these connections so the
+            // idle-kill fires quickly (≤10s after data stops) instead of waiting the
+            // full idle_timeout (60/120s).
+            //
+            // Explicit-rule Direct connections (no availability cache entry) keep the
+            // full lenient idle_timeout for Phase 2 — they are trusted by the operator.
+            let effective_steady_idle = if rules.has_positive_availability_entry(&tld, port) {
+                initial_idle_timeout
+            } else {
+                idle_timeout
+            };
+
+            debug!("Direct connection to {} for '{}' (Phase-2 idle: {}s)",
+                   original_dst, connection_info.routing_domain, effective_steady_idle.as_secs());
+
             let out = connect_tcp_with_mark(original_dst).await?;
-            match forward(inbound, out, None, idle_timeout).await? {
+            match forward(inbound, out, None, initial_idle_timeout, effective_steady_idle).await? {
                 ForwardResult::IdleTimeout => {
-                    let tld = crate::client_context::get_top_level_domain(&connection_info.routing_domain);
-                    let port = original_dst.port();
                     // Only act if the Direct decision came from availability_check.
                     // check_availability() always inserts its result into the cache;
                     // explicit domain/geosite/geoip rules never touch it.
-                    // So a live positive cache entry means this was an availability_check
-                    // Direct — the stall is likely DPI. No entry means explicit rule —
-                    // idle is natural (e.g. dns.google, nel.heroku.com) and no action needed.
                     if rules.has_positive_availability_entry(&tld, port) {
                         warn!(
-                            "Direct connection to '{}' (TLD: '{}') idle-killed after {}s, \
+                            "Direct connection to '{}' (TLD: '{}') idle-killed after ≤{}s+{}s, \
                              forcing proxy routing (availability_check override)",
-                            connection_info.routing_domain, tld, idle_timeout.as_secs()
+                            connection_info.routing_domain, tld,
+                            initial_idle_timeout.as_secs(), effective_steady_idle.as_secs()
                         );
                         rules.mark_unavailable_in_cache(&tld, port);
                     } else {
@@ -892,6 +984,7 @@ async fn forward(
     a: TcpStream,
     b: TcpStream,
     _permit: Option<OwnedSemaphorePermit>,
+    initial_idle_timeout: Duration,
     idle_timeout: Duration,
 ) -> Result<ForwardResult> {
     let (mut ar, mut aw) = a.into_split();
@@ -920,23 +1013,40 @@ async fn forward(
     let b_abort = b_to_a.abort_handle();
     let max_lifetime = Duration::from_secs(MAX_CONNECTION_LIFETIME_SECS);
 
-    // Idle watchdog: checks every `idle_timeout` seconds whether any data has moved
-    // in either direction.  Activity flag is reset after each check; if it's still
-    // false on the next check the connection is considered stalled and gets killed.
-    // Disabled when idle_timeout is zero.
+    // Two-phase idle watchdog:
+    //
+    // Phase 1 — initial_idle_timeout (default 10s):
+    //   Aggressive.  New connections that produce zero data are almost certainly
+    //   DPI-stalled (TLS handshake passed the availability probe but real traffic
+    //   is blocked).  Kill fast so the negative-cache feedback loop fires quickly
+    //   and the browser retries via proxy on the next attempt.
+    //
+    // Phase 2 — idle_timeout (default 120s):
+    //   Lenient.  The connection proved alive (at least one chunk arrived during
+    //   Phase 1).  Allow long-running streams (SSE, downloads, WebSocket) to stay
+    //   open without data for up to idle_timeout seconds.
+    //
+    // Both phases disabled when idle_timeout is zero.
     let idle_check = {
         let act = activity.clone();
         async move {
             if idle_timeout.is_zero() {
                 // Idle timeout disabled — sleep forever (select! arm never fires).
                 std::future::pending::<()>().await;
-            } else {
-                loop {
-                    tokio::time::sleep(idle_timeout).await;
-                    if !act.swap(false, Ordering::Relaxed) {
-                        // No data in the last period — connection is stalled.
-                        break;
-                    }
+                return;
+            }
+            // ── Phase 1 ──────────────────────────────────────────────────────
+            tokio::time::sleep(initial_idle_timeout).await;
+            if !act.swap(false, Ordering::Relaxed) {
+                // Zero data since connection start — DPI stall or dead peer.
+                return;
+            }
+            // ── Phase 2 ──────────────────────────────────────────────────────
+            loop {
+                tokio::time::sleep(idle_timeout).await;
+                if !act.swap(false, Ordering::Relaxed) {
+                    // No data in the last idle_timeout window — connection stalled.
+                    return;
                 }
             }
         }

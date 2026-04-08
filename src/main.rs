@@ -652,6 +652,15 @@ async fn main() -> anyhow::Result<()> {
         .map(|secs| Duration::from_secs(secs as u64))
         .unwrap_or(Duration::from_secs(crate::proxy::DEFAULT_IDLE_TIMEOUT_SECS));
 
+    // Initial (Phase 1) idle timeout: aggressive short window for brand-new connections.
+    // If zero data flows during this window the connection is almost certainly DPI-stalled.
+    // After any data flows the connection graduates to the lenient connection_idle_timeout.
+    let connection_initial_idle_timeout = parsed.get("client")
+        .and_then(|client| client.get("connection_initial_idle_timeout"))
+        .and_then(|v| v.as_integer())
+        .map(|secs| Duration::from_secs(secs as u64))
+        .unwrap_or(Duration::from_secs(crate::proxy::DEFAULT_INITIAL_IDLE_TIMEOUT_SECS));
+
     let tcp_keepalive_time = parsed.get("client")
         .and_then(|c| c.get("tcp_keepalive_time"))
         .and_then(|v| v.as_integer())
@@ -817,6 +826,11 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Cheburproxy client v1.0");
 
+    // Create domain cache early so it can be shared with both the DNS proxy
+    // (which populates it from DNS responses) and the TPROXY accept loop
+    // (which uses it to resolve the real domain behind ECH).
+    let domain_cache: DomainCache = Arc::new(DashMap::new());
+
     // ============ DNS Leak Prevention: Initialize DNS Proxy ============
     // Parse DNS configuration and initialize resolver
     let shared_dns_resolver = {
@@ -946,7 +960,7 @@ async fn main() -> anyhow::Result<()> {
                 log_queries: dns_proxy_log_queries,
             };
 
-            let dns_proxy = Arc::new(DnsProxy::new(proxy_config, dns_resolver.clone()));
+            let dns_proxy = Arc::new(DnsProxy::new(proxy_config, dns_resolver.clone(), domain_cache.clone()));
             tokio::spawn(async move {
                 if let Err(e) = dns_proxy.start().await {
                     error!("DNS Proxy failed: {}", e);
@@ -1056,6 +1070,19 @@ async fn main() -> anyhow::Result<()> {
     
     let shared_state: SharedRuleEngine = Arc::new(ArcSwap::from_pointee(initial_rule_engine));
 
+    // Pre-resolve all explicit rule domains into the ECH reverse IP→domain map.
+    // This runs asynchronously so it does not delay startup; connections arriving
+    // before resolution completes fall through to normal routing (via proxy for
+    // ECH domains).  After it finishes, Stage 1.5 in proxy.rs can match any
+    // destination IP back to the explicit rule domain that should handle it,
+    // regardless of whether the client used the local DNS proxy or DoH.
+    {
+        let engine = (**shared_state.load()).clone();
+        tokio::spawn(async move {
+            engine.populate_ip_domain_map().await;
+        });
+    }
+
     // Spawn signal handler for hot-reload
     let reload_shared_state = shared_state.clone();
     let reload_rule_config = rule_config.clone();
@@ -1081,7 +1108,21 @@ async fn main() -> anyhow::Result<()> {
             ).await {
                 Ok(new_rule_engine) => {
                     reload_shared_state.store(Arc::new(new_rule_engine));
-                    info!("Router configuration reloaded successfully (GeoIP databases shared - memory optimized)");
+                    // Clear the client context cache so that stale proxy-tag entries from
+                    // before the reload do not override the freshly-loaded rules.
+                    // (The context cache is a global lazy_static — it is NOT part of
+                    // RuleEngine and would otherwise persist across reloads for up to
+                    // context_ttl seconds, causing domains newly moved to "direct" to keep
+                    // going through the proxy until the TTL expires.)
+                    let cleared = crate::client_context::CONTEXT_CACHE.len();
+                    crate::client_context::CONTEXT_CACHE.clear();
+                    info!("Router configuration reloaded successfully (GeoIP databases shared - memory optimized); \
+                           client context cache cleared ({} entries evicted)", cleared);
+                    // Re-build the ECH reverse IP→domain map for the new rules.
+                    let engine = (**reload_shared_state.load()).clone();
+                    tokio::spawn(async move {
+                        engine.populate_ip_domain_map().await;
+                    });
                 }
                 Err(e) => {
                     error!("Failed to reload router configuration: {}", e);
@@ -1092,9 +1133,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Create DNS cache for performance optimization (limited size)
     let dns_cache: DnsCache = Arc::new(DashMap::new());
-
-    // Create domain cache for UDP relay (IP->Domain mapping, limited size)
-    let domain_cache: DomainCache = Arc::new(DashMap::new());
+    // (domain_cache was already created above, before the DNS proxy, so it
+    // can be shared between the DNS proxy and the TPROXY accept loop.)
 
     // Periodic cleanup of connection pool
     // P2-7 FIX: Two-pass cleanup to reduce DashMap write lock contention.
@@ -1417,7 +1457,34 @@ async fn main() -> anyhow::Result<()> {
                             };
 
                             let optional_domain = if !use_reverse_dns {
-                                sni_domain
+                                // SNI was successfully extracted from the TLS ClientHello.
+                                //
+                                // ECH workaround: when the client uses Encrypted Client Hello
+                                // (ECH), the visible SNI is a public/outer name chosen by the
+                                // CDN — Cloudflare uses "cloudflare-ech.com". The real target
+                                // domain is encrypted inside the ECH extension and invisible to
+                                // the proxy.
+                                //
+                                // To recover the real domain, we look up the destination IP in
+                                // the DomainCache, which is populated by the DNS proxy from
+                                // A/AAAA records in every DNS response it forwards. If the
+                                // cached domain differs from the SNI, we use the cached domain
+                                // as optional_domain so it appears in candidate_domains alongside
+                                // the outer SNI, giving the routing rules a chance to match it.
+                                let dns_cached_domain = find_domain_by_ip(dst.ip(), &domain_cache).await;
+                                match (&sni_domain, &dns_cached_domain) {
+                                    (Some(sni), Some(dns)) if sni != dns => {
+                                        info!(
+                                            "ECH detected for {}: outer SNI='{}' differs from \
+                                             DNS-cached domain='{}', using DNS domain for routing",
+                                            dst.ip(), sni, dns
+                                        );
+                                        Some(dns.clone())
+                                    }
+                                    // No DNS cache entry, or outer SNI equals the real domain
+                                    // (no ECH) — fall through to the plain SNI path.
+                                    _ => sni_domain,
+                                }
                             } else {
                                 match resolve_domain_from_ip(dst.ip(), &engine, &cache, resolver).await {
                                     Ok(domain) => {
@@ -1441,7 +1508,7 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             debug!("Final domain for routing: {:?}", optional_domain);
-                            if let Err(e) = handle_tcp_stream(stream, dst, engine, optional_domain, upstream_proxy_timeout, context_enabled, Duration::from_secs(context_ttl), connection_idle_timeout).await {
+                            if let Err(e) = handle_tcp_stream(stream, dst, engine, optional_domain, upstream_proxy_timeout, context_enabled, Duration::from_secs(context_ttl), connection_initial_idle_timeout, connection_idle_timeout).await {
                                 match &e {
                                     crate::proxy::ProxyError::IoError(io_err) if crate::proxy::is_data_plane_error(io_err) => {
                                         debug!("Connection to {} closed (peer disconnect): {}", dst, io_err);
@@ -1556,7 +1623,7 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     };
-                    if let Err(e) = handle_tcp_stream(stream, dst, engine, domain, upstream_proxy_timeout, context_enabled, Duration::from_secs(context_ttl), connection_idle_timeout).await {
+                    if let Err(e) = handle_tcp_stream(stream, dst, engine, domain, upstream_proxy_timeout, context_enabled, Duration::from_secs(context_ttl), connection_initial_idle_timeout, connection_idle_timeout).await {
                         match &e {
                             crate::proxy::ProxyError::IoError(io_err) if crate::proxy::is_data_plane_error(io_err) => {
                                 debug!("Connection closed (peer disconnect): {}", io_err);

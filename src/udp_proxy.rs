@@ -379,7 +379,7 @@ impl TcpUdpTunnel {
         let auth_methods = if proxy.auth.username.is_empty() && proxy.auth.pass.is_empty() {
             vec![SOCKS5_NO_AUTH]
         } else {
-            vec![SOCKS5_NO_AUTH, SOCKS5_USERNAME_PASSWORD_AUTH]
+            vec![SOCKS5_USERNAME_PASSWORD_AUTH]
         };
 
         let mut handshake = vec![SOCKS5_VERSION, auth_methods.len() as u8];
@@ -1666,7 +1666,7 @@ pub async fn create_socks5_udp_associate(
     let auth_methods = if username.is_empty() && password.is_empty() {
         vec![SOCKS5_NO_AUTH]
     } else {
-        vec![SOCKS5_NO_AUTH, SOCKS5_USERNAME_PASSWORD_AUTH] // Prefer no auth if available
+        vec![SOCKS5_USERNAME_PASSWORD_AUTH]
     };
 
     let mut handshake = vec![SOCKS5_VERSION, auth_methods.len() as u8];

@@ -284,6 +284,13 @@ pub struct RuleEngine {
     availability_inflight: Arc<DashMap<String, Vec<oneshot::Sender<bool>>>>,
     /// Configuration settings
     config: RuleEngineConfig,
+    /// Reverse IP→domain map built by pre-resolving all explicit rule domains.
+    ///
+    /// Used as an ECH workaround: when the TLS SNI is a Cloudflare outer name
+    /// (e.g. "cloudflare-ech.com") and no candidate domain matches an explicit
+    /// rule, Stage 1.5 looks up the destination IP here to find the real domain
+    /// regardless of whether the client uses the local DNS proxy.
+    ip_domain_map: Arc<DashMap<IpAddr, Vec<String>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -464,6 +471,7 @@ impl RuleEngine {
             availability_sem: Arc::new(Semaphore::new(AVAILABILITY_MAX_PARALLEL)),
             availability_inflight: Arc::new(DashMap::new()),
             config,
+            ip_domain_map: Arc::new(DashMap::new()),
         })
     }
 
@@ -493,6 +501,7 @@ impl RuleEngine {
             availability_sem: Arc::new(Semaphore::new(AVAILABILITY_MAX_PARALLEL)),
             availability_inflight: Arc::new(DashMap::new()),
             config,
+            ip_domain_map: Arc::new(DashMap::new()),
         })
     }
 
@@ -679,6 +688,32 @@ impl RuleEngine {
             None if extracted.is_empty() => None,
             None => Some(extracted.to_vec()),
         }
+    }
+
+    /// Get routing decision based **only** on explicit domain patterns (no geosite/geoip/availability).
+    ///
+    /// Returns `Some` when the domain matches a literal domain pattern in any rule.
+    /// This is a fast O(rules × patterns) scan with no side-effects (no cache reads/writes,
+    /// no DNS, no async I/O).
+    ///
+    /// Used to give explicit domain rules absolute priority over the client context cache,
+    /// so that adding a domain to (or removing it from) a rule takes effect immediately after
+    /// a config reload — without waiting for stale context-cache entries to expire.
+    pub fn get_explicit_domain_decision(&self, domain: &str) -> Option<RoutingDecision> {
+        if domain.is_empty() {
+            return None;
+        }
+        let domain_lower = domain.to_lowercase();
+        // Only Pass 1: explicit domain pattern matching (no geosite, no geoip, no availability).
+        for rule in self.rules.iter() {
+            if self.domain_matches(&rule.domain_patterns, &domain_lower) {
+                if self.config.enable_detailed_logging {
+                    debug!("Explicit domain priority-check for '{}': matched rule tag '{}'", domain, rule.tag);
+                }
+                return Some(self.tag_to_decision(&rule.tag));
+            }
+        }
+        None
     }
 
     /// Get routing decision for a domain with caching and optimized matching
@@ -878,6 +913,63 @@ impl RuleEngine {
             .collect()
     }
 
+    /// Pre-resolve all explicit rule domains and build a reverse IP→domain map.
+    ///
+    /// This is the ECH workaround core: when a browser uses Encrypted Client Hello
+    /// (ECH), the visible TLS SNI is `cloudflare-ech.com` (the Cloudflare outer name)
+    /// rather than the real target domain. Stage 1 of routing finds no explicit match
+    /// for that name. Stage 1.5 then looks up the destination IP in this map to
+    /// recover the real domain, enabling the correct routing decision.
+    ///
+    /// The map is populated asynchronously at startup (and after each SIGHUP reload)
+    /// so it never blocks the accept loop. Entries are stored as `IP → Vec<domain>` to
+    /// handle Cloudflare's per-customer IP diversity; all matching domains are
+    /// returned and checked against explicit rules in order.
+    pub async fn populate_ip_domain_map(&self) {
+        let mut resolved_count = 0usize;
+        let mut domain_count = 0usize;
+
+        for rule in self.rules.iter() {
+            for pattern in &rule.domain_patterns {
+                let domain = match pattern {
+                    DomainPattern::DomainAndSubs(d) => d.clone(),
+                };
+                domain_count += 1;
+
+                match self.resolver.resolve(&domain).await {
+                    Ok(ips) => {
+                        for ip in ips {
+                            self.ip_domain_map
+                                .entry(ip)
+                                .or_insert_with(Vec::new)
+                                .push(domain.clone());
+                            resolved_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("ip_domain_map: could not resolve '{}': {}", domain, e);
+                    }
+                }
+            }
+        }
+
+        info!(
+            "ECH reverse map ready: resolved {}/{} domains → {} IP entries",
+            domain_count - (domain_count - resolved_count.min(domain_count)),
+            domain_count,
+            self.ip_domain_map.len()
+        );
+    }
+
+    /// Look up all explicit rule domains that resolved to the given IP.
+    ///
+    /// Returns `Some(domains)` when the map has an entry for this IP, `None` otherwise.
+    /// Callers should iterate the returned list and check each domain with
+    /// `get_explicit_domain_decision` to find the correct routing decision.
+    pub fn lookup_domains_by_ip(&self, ip: &IpAddr) -> Option<Vec<String>> {
+        self.ip_domain_map.get(ip).map(|entry| entry.value().clone())
+    }
+
     /// Get cache statistics for monitoring
     pub fn get_cache_stats(&self) -> (usize, usize, usize, usize) {
         (self.cache.len(), self.dns_cache.len(), self.availability_cache.len(), self.availability_inflight.len())
@@ -945,11 +1037,23 @@ impl RuleEngine {
         }
     }
 
-    /// Check domain availability by attempting TLS handshake to specified port
-    /// Uses: domain:port cache key, singleflight, bounded concurrency, overall deadline.
+    /// Check domain availability — proxy-first strategy.
+    ///
+    /// ## Cache hit (repeat visits)
+    /// Return the cached bool immediately.  Cached `true` → Direct; cached `false` → Proxy.
+    ///
+    /// ## Cache miss (first encounter or expired)
+    /// Return `false` immediately so the **current connection goes via proxy** (guaranteed
+    /// success on first visit), then spawn a background task to run the actual HTTP probe.
+    /// When the probe completes it populates the cache; subsequent connections see the
+    /// cached result and route Direct if the site is reachable.
+    ///
+    /// Singleflight: if a background probe is already running for this key, do nothing extra
+    /// (return `false` immediately — another proxy connection won't hurt).
     async fn check_availability(&self, domain: &str, port: u16) -> bool {
         let key = format!("{}:{}", domain, port);
 
+        // ── Fast path: cached result ──────────────────────────────────────────
         if let Some(cached) = self.availability_cache.get(&key) {
             let ttl = cached.2;
             if cached.1.elapsed() < Duration::from_secs(ttl) {
@@ -957,74 +1061,77 @@ impl RuleEngine {
             }
         }
 
-        // P3 FIX: Use DashMap entry API for atomic check-and-insert (eliminates TOCTOU race)
-        let (tx, rx) = oneshot::channel::<bool>();
+        // ── Slow path: no valid cache entry ──────────────────────────────────
+        // Proxy-first: return false now (route via proxy) and probe in background.
+        //
+        // Singleflight via inflight map: if this key already has an entry a background
+        // probe is running — don't spawn a duplicate, just return false again.
         {
             use dashmap::mapref::entry::Entry;
             match self.availability_inflight.entry(key.clone()) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().push(tx);
-                    drop(entry);
-                    return rx.await.unwrap_or(false);
+                Entry::Occupied(_) => {
+                    // Background probe already running for this domain — return false
+                    // (proxy-first; the probe will update the cache when done).
+                    debug!("Background availability probe already running for '{}', routing via proxy", key);
+                    return false;
                 }
                 Entry::Vacant(entry) => {
-                    entry.insert(vec![tx]);
+                    // Mark as inflight with an empty waiters list.
+                    // No one blocks on this probe — it updates the cache upon completion.
+                    entry.insert(vec![]);
                 }
             }
         }
 
-        // P1-4 FIX: Use a Drop guard to ensure the inflight map entry is always cleaned up,
-        // even if this future is cancelled (e.g., connection dropped mid-check).
-        // Previously, cancelled futures left orphan entries that leaked permanently.
-        struct InFlightCleanup<'a> {
-            map: &'a DashMap<String, Vec<oneshot::Sender<bool>>>,
-            key: String,
-            completed: bool,
-        }
-        impl<'a> Drop for InFlightCleanup<'a> {
-            fn drop(&mut self) {
-                if !self.completed {
-                    // Future was cancelled — clean up the entry and notify waiters with false
-                    if let Some((_, waiters)) = self.map.remove(&self.key) {
-                        for w in waiters {
-                            let _ = w.send(false);
-                        }
-                    }
-                    debug!("Availability check for '{}' was cancelled, inflight entry cleaned up", self.key);
+        // Clone engine (cheap — all fields are Arc) and move into spawned task.
+        let engine = self.clone();
+        let domain_owned = domain.to_string();
+        let key_owned = key.clone();
+
+        tokio::spawn(async move {
+            // Overall deadline: min of legacy timeout and V2 overall_budget.
+            let deadline = TokioInstant::now()
+                + engine.config.availability_check_timeout
+                    .min(engine.config.availability_config.overall_budget);
+
+            // Bounded concurrency (DoS safety).
+            let permit = match tokio::time::timeout_at(deadline, engine.availability_sem.acquire()).await {
+                Ok(Ok(p)) => p,
+                _ => {
+                    debug!("Background availability probe for '{}' could not acquire semaphore, caching as unavailable", key_owned);
+                    engine.availability_cache.insert(
+                        key_owned.clone(),
+                        (false, Instant::now(), AVAILABILITY_FAILURE_SHORT_TTL_SECS),
+                    );
+                    engine.finish_availability_inflight(&key_owned, false);
+                    return;
                 }
+            };
+
+            let res = engine.perform_http_availability_check(&domain_owned, port, deadline).await;
+            drop(permit);
+
+            let available = res.is_available();
+            let ttl = res.cache_ttl(&engine.config);
+
+            engine.availability_cache.insert(key_owned.clone(), (available, Instant::now(), ttl));
+            engine.finish_availability_inflight(&key_owned, available);
+
+            if available {
+                info!(
+                    "Background availability: '{}' is reachable, future connections will go Direct",
+                    domain_owned
+                );
+            } else {
+                debug!(
+                    "Background availability: '{}' unreachable ({:?}), staying on proxy",
+                    domain_owned, res
+                );
             }
-        }
-        let mut guard = InFlightCleanup {
-            map: &self.availability_inflight,
-            key: key.clone(),
-            completed: false,
-        };
+        });
 
-        // Overall deadline: use the smaller of the legacy availability_check_timeout and
-        // the V2 overall_budget so that both config paths are respected.
-        let deadline = TokioInstant::now() + self.config.availability_check_timeout
-            .min(self.config.availability_config.overall_budget);
-
-        // bounded concurrency (DoS safety)
-        let permit = match tokio::time::timeout_at(deadline, self.availability_sem.acquire()).await {
-            Ok(Ok(p)) => p,
-             _ => {
-                guard.completed = true; // prevent double cleanup
-                self.finish_availability_inflight(&key, false);
-                return false;
-             }
-        };
-
-        let res = self.perform_http_availability_check(domain, port, deadline).await;
-        drop(permit);
-
-        let available = res.is_available();
-        let ttl = res.cache_ttl(&self.config);
-
-        self.availability_cache.insert(key.clone(), (available, Instant::now(), ttl));
-        guard.completed = true; // prevent guard from cleaning up — we'll do it manually
-        self.finish_availability_inflight(&key, available);
-        available
+        // Return false so the current connection uses proxy (proxy-first guarantee).
+        false
     }
 
     fn finish_availability_inflight(&self, key: &str, value: bool) {

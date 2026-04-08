@@ -16,6 +16,7 @@ use crate::dns_resolver::InternalDnsResolver;
 use dashmap::DashMap;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
+    rr::{RData, RecordType},
     serialize::binary::{BinDecodable, BinEncodable},
 };
 use log::{debug, error, info, warn};
@@ -25,6 +26,11 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+
+/// IP→domain mapping cache shared with the TPROXY accept loop.
+/// Populated from DNS A/AAAA records so the real target domain is available
+/// even when ECH hides it behind a public outer SNI (e.g. cloudflare-ech.com).
+type DomainCache = Arc<DashMap<IpAddr, (String, Instant)>>;
 
 /// Maximum DNS UDP message size (EDNS0 default)
 const MAX_DNS_UDP_SIZE: usize = 4096;
@@ -84,15 +90,19 @@ pub struct DnsProxy {
     config: DnsProxyConfig,
     resolver: Arc<InternalDnsResolver>,
     cache: Arc<DashMap<String, CachedDnsResponse>>,
+    /// Shared IP→domain cache.  Populated from A/AAAA records in DNS responses so
+    /// the TPROXY accept loop can find the real target domain even when ECH is used.
+    domain_cache: DomainCache,
 }
 
 impl DnsProxy {
     /// Create a new DNS proxy
-    pub fn new(config: DnsProxyConfig, resolver: Arc<InternalDnsResolver>) -> Self {
+    pub fn new(config: DnsProxyConfig, resolver: Arc<InternalDnsResolver>, domain_cache: DomainCache) -> Self {
         Self {
             config,
             resolver,
             cache: Arc::new(DashMap::new()),
+            domain_cache,
         }
     }
 
@@ -231,8 +241,8 @@ impl DnsProxy {
         socket: Arc<UdpSocket>,
         raw_fd: i32,
     ) -> anyhow::Result<()> {
-        // Parse query to extract info for logging and cache key
-        let (query_id, cache_key, log_info) = match Message::from_bytes(&query_data) {
+        // Parse query to extract info for logging, cache key, and ECH domain bridge.
+        let (query_id, cache_key, log_info, queried_domain, record_type) = match Message::from_bytes(&query_data) {
             Ok(msg) => {
                 if msg.queries().is_empty() {
                     warn!("DNS Proxy: Empty query from {}", client_addr);
@@ -244,18 +254,44 @@ impl DnsProxy {
                 let record_type = query.query_type();
                 let cache_key = format!("{}:{:?}", domain, record_type);
                 let log_info = format!("{} ({:?})", domain, record_type);
+                // Strip trailing dot (FQDN form "example.com.") for the domain cache.
+                let queried_domain = domain.trim_end_matches('.').to_lowercase();
 
                 if self.config.log_queries {
                     debug!("DNS Proxy: Query from {} for {}", client_addr, log_info);
                 }
 
-                (msg.id(), cache_key, log_info)
+                (msg.id(), cache_key, log_info, queried_domain, record_type)
             }
             Err(e) => {
                 warn!("DNS Proxy: Invalid DNS query from {}: {}", client_addr, e);
                 return Ok(());
             }
         };
+
+        // Suppress HTTPS/SVCB records (TYPE65/TYPE64) to prevent ECH.
+        //
+        // Encrypted Client Hello (ECH) requires the browser to first receive an
+        // HTTPS/SVCB DNS record (TYPE65) containing the ECH configuration. By
+        // returning a valid NOERROR response with zero answers, the browser sees
+        // "no HTTPS record exists" and falls back to standard TLS with a plaintext
+        // SNI — which the transparent proxy can extract and use for routing.
+        //
+        // Without this, Cloudflare-hosted domains in the `direct` rule would still
+        // be routed through the upstream proxy because the browser sends ECH with
+        // outer SNI "cloudflare-ech.com" instead of the real domain.
+        //
+        // Cost: ECH privacy is not useful in a transparent-proxy context (the proxy
+        // sees all traffic anyway), and HTTP/3 negotiation via SVCB is lost (HTTP/2
+        // still works normally).
+        if record_type == RecordType::HTTPS || record_type == RecordType::SVCB {
+            if self.config.log_queries {
+                debug!("DNS Proxy: Suppressing {} (ECH prevention)", log_info);
+            }
+            let response = self.build_error_response_from_query(&query_data, ResponseCode::NoError);
+            self.send_response(raw_fd, &socket, &response, client_addr, dst_ip).await?;
+            return Ok(());
+        }
 
         // Check cache
         if let Some(cached) = self.cache.get(&cache_key) {
@@ -264,6 +300,9 @@ impl DnsProxy {
                     debug!("DNS Proxy: Cache hit for {}", log_info);
                 }
                 let response = Self::rewrite_response_id(&cached.response, query_id);
+                // Even on a cache hit, refresh the IP→domain mapping so the TPROXY
+                // path always has a fresh entry for this client's recent DNS query.
+                self.populate_domain_cache_from_response(&cached.response, &queried_domain);
                 self.send_response(raw_fd, &socket, &response, client_addr, dst_ip)
                     .await?;
                 return Ok(());
@@ -330,7 +369,49 @@ impl DnsProxy {
             }
         }
 
+        // Populate the shared IP→domain cache from A/AAAA records in the response.
+        // This lets the TPROXY accept loop find the real target domain even when ECH
+        // replaces the visible SNI with cloudflare-ech.com or another public name.
+        self.populate_domain_cache_from_response(&response, &queried_domain);
+
         Ok(())
+    }
+
+    /// Parse a raw DNS response and write every A/AAAA answer IP to `domain_cache`,
+    /// keyed by IP address and mapping to the original queried domain name.
+    ///
+    /// We intentionally key by the **queried** domain (question section) rather than
+    /// the CNAME target so that the routing decision is made against the name the
+    /// client actually asked for — which is the name the operator put in router.json.
+    fn populate_domain_cache_from_response(&self, response: &[u8], queried_domain: &str) {
+        if queried_domain.is_empty() {
+            return;
+        }
+        if let Ok(msg) = Message::from_bytes(response) {
+            if msg.response_code() != ResponseCode::NoError {
+                return;
+            }
+            let now = Instant::now();
+            for record in msg.answers() {
+                match record.data() {
+                    Some(RData::A(addr)) => {
+                        self.domain_cache.insert(
+                            IpAddr::V4(addr.0),
+                            (queried_domain.to_string(), now),
+                        );
+                        debug!("DNS→DomainCache: {} → {}", addr.0, queried_domain);
+                    }
+                    Some(RData::AAAA(addr)) => {
+                        self.domain_cache.insert(
+                            IpAddr::V6(addr.0),
+                            (queried_domain.to_string(), now),
+                        );
+                        debug!("DNS→DomainCache: {} → {}", addr.0, queried_domain);
+                    }
+                    _ => {} // CNAME, HTTPS/SVCB, MX, etc. — skip
+                }
+            }
+        }
     }
 
     /// Send a DNS response, using pktinfo to set the correct source IP

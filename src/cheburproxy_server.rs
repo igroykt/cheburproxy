@@ -475,9 +475,10 @@ fn is_data_plane_error(err: &io::Error) -> bool {
     )
 }
 
-/// Default idle timeout for server-side connections (seconds).
-/// Matches the client-side default. Set to 0 to disable.
+/// Default steady-state idle timeout for server-side connections (seconds).
 const DEFAULT_SERVER_IDLE_TIMEOUT_SECS: u64 = 120;
+/// Default initial (Phase 1) idle timeout for server-side connections (seconds).
+const DEFAULT_SERVER_INITIAL_IDLE_TIMEOUT_SECS: u64 = 10;
 
 /// Copy bytes from `reader` to `writer`, setting `activity` on every chunk.
 async fn copy_with_activity_server(
@@ -500,10 +501,20 @@ async fn copy_with_activity_server(
 }
 
 async fn forward_streams(client: TcpStream, target: TcpStream) -> ProxyResult<()> {
-    forward_streams_with_idle(client, target, Duration::from_secs(DEFAULT_SERVER_IDLE_TIMEOUT_SECS)).await
+    forward_streams_with_idle(
+        client,
+        target,
+        Duration::from_secs(DEFAULT_SERVER_INITIAL_IDLE_TIMEOUT_SECS),
+        Duration::from_secs(DEFAULT_SERVER_IDLE_TIMEOUT_SECS),
+    ).await
 }
 
-async fn forward_streams_with_idle(client: TcpStream, target: TcpStream, idle_timeout: Duration) -> ProxyResult<()> {
+async fn forward_streams_with_idle(
+    client: TcpStream,
+    target: TcpStream,
+    initial_idle_timeout: Duration,
+    idle_timeout: Duration,
+) -> ProxyResult<()> {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut target_read, mut target_write) = target.into_split();
 
@@ -523,17 +534,26 @@ async fn forward_streams_with_idle(client: TcpStream, target: TcpStream, idle_ti
     let t2c_abort = target_to_client.abort_handle();
     let max_lifetime = Duration::from_secs(MAX_CONNECTION_LIFETIME_SECS);
 
+    // Two-phase idle watchdog (mirrors proxy.rs::forward):
+    // Phase 1 (initial_idle_timeout): aggressive — kill if zero data since connection start.
+    // Phase 2 (idle_timeout): lenient — kill only after a full idle period with no data.
     let idle_check = {
         let act = activity.clone();
         async move {
             if idle_timeout.is_zero() {
                 std::future::pending::<()>().await;
-            } else {
-                loop {
-                    tokio::time::sleep(idle_timeout).await;
-                    if !act.swap(false, Ordering::Relaxed) {
-                        break;
-                    }
+                return;
+            }
+            // Phase 1
+            tokio::time::sleep(initial_idle_timeout).await;
+            if !act.swap(false, Ordering::Relaxed) {
+                return;
+            }
+            // Phase 2
+            loop {
+                tokio::time::sleep(idle_timeout).await;
+                if !act.swap(false, Ordering::Relaxed) {
+                    return;
                 }
             }
         }
