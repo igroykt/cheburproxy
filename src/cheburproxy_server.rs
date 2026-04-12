@@ -274,18 +274,57 @@ async fn handle_socks5_auth(stream: &mut TcpStream, config: &ServerConfig) -> Pr
     Ok(())
 }
 
-/// Returns a shared, lazily-initialized DNS resolver.
+/// Returns a shared, lazily-initialized DNS resolver using DNS-over-TLS.
+///
+/// DNS-over-TLS (DoT) is used instead of plain UDP to prevent DNS queries from
+/// being visible to the datacenter network or any network observer between the
+/// server and the upstream DNS resolver.
+///
 /// Using a singleton avoids spawning new background tasks and UDP sockets on every DNS call.
 fn get_shared_resolver() -> &'static TokioAsyncResolver {
     use std::sync::OnceLock;
     static RESOLVER: OnceLock<TokioAsyncResolver> = OnceLock::new();
     RESOLVER.get_or_init(|| {
         let mut resolver_config = ResolverConfig::new();
+        // Google Public DNS over TLS (port 853)
+        // Uses encrypted DNS to prevent query contents from leaking as plaintext UDP.
+        resolver_config.add_name_server(NameServerConfig {
+            socket_addr: "8.8.8.8:853".parse().unwrap(),
+            protocol: Protocol::Tls,
+            tls_dns_name: Some("dns.google".to_string()),
+            trust_negative_responses: true,
+            tls_config: None,
+            bind_addr: None,
+        });
+        resolver_config.add_name_server(NameServerConfig {
+            socket_addr: "8.8.4.4:853".parse().unwrap(),
+            protocol: Protocol::Tls,
+            tls_dns_name: Some("dns.google".to_string()),
+            trust_negative_responses: true,
+            tls_config: None,
+            bind_addr: None,
+        });
+        // Cloudflare DNS over TLS (port 853) — fallback
+        resolver_config.add_name_server(NameServerConfig {
+            socket_addr: "1.1.1.1:853".parse().unwrap(),
+            protocol: Protocol::Tls,
+            tls_dns_name: Some("cloudflare-dns.com".to_string()),
+            trust_negative_responses: true,
+            tls_config: None,
+            bind_addr: None,
+        });
+        // Plain UDP fallback servers.
+        //
+        // Under burst load, upstream DNS providers (Google, Cloudflare) rate-limit concurrent
+        // TLS handshakes from a single IP, causing intermittent "connection refused" errors on
+        // port 853.  Adding plain UDP servers (port 53) as fallback lets hickory-resolver use
+        // whichever name server responds fastest: DoT when TLS succeeds, UDP when it is
+        // throttled.  On a datacenter VPS plain UDP DNS does not reveal the end-user identity.
         resolver_config.add_name_server(NameServerConfig {
             socket_addr: "8.8.8.8:53".parse().unwrap(),
             protocol: Protocol::Udp,
             tls_dns_name: None,
-            trust_negative_responses: false,
+            trust_negative_responses: true,
             tls_config: None,
             bind_addr: None,
         });
@@ -293,7 +332,7 @@ fn get_shared_resolver() -> &'static TokioAsyncResolver {
             socket_addr: "1.1.1.1:53".parse().unwrap(),
             protocol: Protocol::Udp,
             tls_dns_name: None,
-            trust_negative_responses: false,
+            trust_negative_responses: true,
             tls_config: None,
             bind_addr: None,
         });

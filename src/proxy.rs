@@ -725,9 +725,18 @@ pub async fn handle_tcp_stream(
 
     let connection_info = gather_connection_info(&inbound, &optional_domain, &original_dst).await?;
 
-    // DNS ports: always direct (bypass routing).
+    // DNS ports (53 and 853): route directly, bypassing SOCKS5 proxy routing.
+    //
+    // This is intentional for transparent-proxy deployments where DNS queries from
+    // LAN clients are intercepted by iptables TPROXY rules.  TCP DNS/DoT connections
+    // to the DNS proxy on this machine or to the configured upstream DNS servers
+    // must not be sent through SOCKS5 — doing so would create a resolution loop.
+    //
+    // If you are deploying without a local DNS proxy (dns_proxy_enabled = false) and
+    // need TCP DNS traffic to be routed through SOCKS5, remove these ports from the
+    // bypass list or set up an iptables ACCEPT rule for the proxy's own DNS traffic.
     if original_dst.port() == 53 || original_dst.port() == 853 {
-        debug!("DNS port detected ({}), using direct connection", original_dst.port());
+        debug!("DNS port detected ({}), routing direct (bypass SOCKS5)", original_dst.port());
         let out = connect_tcp_with_mark(original_dst).await?;
         return forward(inbound, out, None, initial_idle_timeout, idle_timeout).await.map(|_| ());
     }

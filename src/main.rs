@@ -43,7 +43,7 @@ use std::net::IpAddr;
 
 static ACCEPTED_CONNS_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ZERO_TRAFFIC_STREAK: AtomicU32 = AtomicU32::new(0);
-use crate::transparent::{get_original_dst, create_transparent_tcp_socket_default};
+use crate::transparent::{get_original_dst, create_transparent_tcp_socket_default, connect_tcp_with_mark};
 use crate::udp_proxy::{run_udp_proxy, Config, handle_udp_packet, SessionKey, UdpSession};
 // use crate::dns_proxy::run_dns_proxy;  // Removed - unstable
 use crate::sni::extract_sni;
@@ -471,8 +471,8 @@ async fn reload_router_config(_rule_engine_config: &RuleEngineConfig, _resolver:
 
 /// Establish UDP associate with upstream proxy
 async fn establish_udp_associate(proxy: &crate::router::Proxy, timeout: Duration) -> Result<SocketAddr, ProxyError> {
-    let mut stream = TcpStream::connect((proxy.server_addr.as_str(), proxy.server_port)).await
-        .map_err(ProxyError::Io)?;
+    let mut stream = connect_tcp_with_mark((proxy.server_addr.as_str(), proxy.server_port)).await
+        .map_err(|e| ProxyError::Io(std::io::Error::other(e.to_string())))?;
 
     // SOCKS5 greeting
     let auth_methods = if proxy.auth.username.is_empty() && proxy.auth.pass.is_empty() {

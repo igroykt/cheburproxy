@@ -6,14 +6,14 @@
 use super::{DnsError, DnsProtocolHandler, DnsResult};
 use async_trait::async_trait;
 use hickory_proto::{
-    op::{Message, MessageType, OpCode, Query},
+    op::{Edns, Message, MessageType, OpCode, Query},
     rr::{Name, RecordType},
     serialize::binary::{BinDecodable, BinEncodable},
 };
 use log::{debug, warn};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-use tokio::net::UdpSocket;
+use crate::transparent::bind_udp_with_mark;
 
 /// Plain DNS handler configuration
 #[derive(Debug, Clone)]
@@ -61,7 +61,13 @@ impl PlainDnsHandler {
         message.set_message_type(MessageType::Query);
         message.set_op_code(OpCode::Query);
         message.set_recursion_desired(true);
-        
+
+        // Set EDNS0 OPT record with DO (DNSSEC OK) bit so the upstream validates DNSSEC.
+        let mut edns = Edns::new();
+        edns.set_max_payload(4096);
+        edns.set_dnssec_ok(true);
+        message.set_edns(edns);
+
         let query = Query::query(name, record_type);
         message.add_query(query);
         
@@ -132,11 +138,13 @@ impl PlainDnsHandler {
         let query_a = Self::build_query(domain, RecordType::A)?;
         let query_aaaa = Self::build_query(domain, RecordType::AAAA)?;
         
-        // Create two separate sockets for concurrent queries
-        let socket_a = UdpSocket::bind("0.0.0.0:0").await
-            .map_err(|e| DnsError::Io(e))?;
-        let socket_aaaa = UdpSocket::bind("0.0.0.0:0").await
-            .map_err(|e| DnsError::Io(e))?;
+        // Create two separate sockets for concurrent queries.
+        // bind_udp_with_mark sets SO_MARK=2 so that iptables TPROXY rules
+        // do not redirect these outgoing DNS packets back into the proxy.
+        let socket_a = bind_udp_with_mark("0.0.0.0:0").await
+            .map_err(|e| DnsError::Io(std::io::Error::other(e)))?;
+        let socket_aaaa = bind_udp_with_mark("0.0.0.0:0").await
+            .map_err(|e| DnsError::Io(std::io::Error::other(e)))?;
 
 
         
@@ -295,10 +303,9 @@ impl DnsProtocolHandler for PlainDnsHandler {
         
         for server in &self.config.servers {
             for attempt in 0..self.config.max_retries {
-                let socket = UdpSocket::bind("0.0.0.0:0").await
-                    .map_err(|e| DnsError::Io(e))?;
+                let socket = bind_udp_with_mark("0.0.0.0:0").await
+                    .map_err(|e| DnsError::Io(std::io::Error::other(e)))?;
 
-                
                 if let Err(e) = socket.send_to(query_data, server).await {
                     debug!("Plain DNS raw: send error to {} (attempt {}): {}", server, attempt + 1, e);
                     last_error = Some(DnsError::Io(e));

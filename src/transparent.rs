@@ -4,7 +4,7 @@ use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::sync::Once;
 use nix::libc;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 // Standard socket options for Linux (defined as constants for better maintainability)
 pub const IP_TRANSPARENT: i32 = 19;     // IP_TRANSPARENT (SOL_IP level)
@@ -167,16 +167,88 @@ pub async fn connect_tcp<A: tokio::net::ToSocketAddrs>(addr: A) -> anyhow::Resul
     Ok(stream)
 }
 
-/// Establish a TCP connection and set SO_MARK to bypass TPROXY iptables rules.
+/// Establish a TCP connection with SO_MARK=0x2 set **before** the SYN is sent.
 ///
-/// The mark value 2 (0x2) identifies proxy-originated traffic so iptables can skip
-/// re-intercepting it. It must differ from the TPROXY mark (0x1) to avoid policy
-/// routing loops where outgoing packets are sent back to loopback instead of the destination.
-pub async fn connect_tcp_with_mark<A: tokio::net::ToSocketAddrs>(addr: A) -> anyhow::Result<tokio::net::TcpStream> {
-    let stream = tokio::net::TcpStream::connect(addr).await?;
-    // Set SO_MARK to bypass TPROXY iptables rules
-    let fd = stream.as_raw_fd();
-    // Mark 0x2: identifies proxy-originated traffic. Must differ from TPROXY mark (0x1) to avoid policy routing loop.
+/// ## Why this matters
+///
+/// The iptables `TPROXY_MARK` chain in the `OUTPUT` hook inspects every packet that
+/// leaves the proxy process.  Any packet whose destination port is in `PORTS_TCP` gets
+/// `mark 0x1`, which policy-routes it to routing table 100 (`local 0.0.0.0/0 dev lo`) —
+/// i.e. back to loopback.  If SO_MARK were set *after* `connect()`, the SYN would leave
+/// without the mark, hit `TPROXY_MARK`, get mark 0x1, and loop back to the proxy.
+///
+/// By using `TcpSocket` (which exposes the raw fd before the connect syscall), we can
+/// set SO_MARK=0x2 on the socket descriptor **before** any packet is sent.  The kernel
+/// attaches the mark to the socket's routing metadata so every packet — including the
+/// initial SYN — carries `fwmark 0x2`.  The `TPROXY_MARK` rule `-m mark --mark 0x2
+/// -j RETURN` then skips the socket, preventing the loop.
+///
+/// ## Address resolution
+///
+/// `TcpSocket::connect()` requires a `SocketAddr`.  We resolve the generic
+/// `ToSocketAddrs` argument with `lookup_host()` and try each resolved address in turn,
+/// matching IPv4 destinations to IPv4 sockets and IPv6 destinations to IPv6 sockets.
+/// This preserves the same semantics as the previous `TcpStream::connect()` call.
+pub async fn connect_tcp_with_mark<A: tokio::net::ToSocketAddrs>(addr: A) -> anyhow::Result<TcpStream> {
+    // Resolve the address (may be a SocketAddr, (&str, u16), or a hostname:port string).
+    let mut addrs = tokio::net::lookup_host(addr).await?;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    loop {
+        let addr = match addrs.next() {
+            Some(a) => a,
+            None => {
+                return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no addresses resolved")));
+            }
+        };
+
+        // Create a socket that matches the address family.
+        let socket = match addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4(),
+            SocketAddr::V6(_) => TcpSocket::new_v6(),
+        };
+        let socket = match socket {
+            Ok(s) => s,
+            Err(e) => { last_err = Some(e.into()); continue; }
+        };
+
+        // Set SO_MARK BEFORE connect so the SYN carries the mark and bypasses TPROXY_MARK.
+        // Mark 0x2: proxy-originated traffic. Must differ from TPROXY mark (0x1).
+        let mark: libc::c_int = 2;
+        let ret = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                SO_MARK,
+                &mark as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            log::warn!(
+                "connect_tcp_with_mark: failed to set SO_MARK on TCP socket: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Async connect — SYN goes out with SO_MARK=0x2 already set.
+        match socket.connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => { last_err = Some(e.into()); continue; }
+        }
+    }
+}
+
+/// Bind a UDP socket and immediately set SO_MARK to bypass TPROXY iptables rules.
+///
+/// Plain DNS (UDP) sockets must carry this mark so that iptables TPROXY rules do not
+/// redirect the outgoing DNS packets back into the proxy, which would create an infinite
+/// resolution loop.  The mark value (2) matches the one used by `connect_tcp_with_mark`.
+///
+/// Returns a bound, non-blocking `tokio::net::UdpSocket` ready for async I/O.
+pub async fn bind_udp_with_mark(addr: &str) -> anyhow::Result<UdpSocket> {
+    let std_socket = std::net::UdpSocket::bind(addr)?;
+    let fd = std_socket.as_raw_fd();
     let mark: libc::c_int = 2;
     let ret = unsafe {
         libc::setsockopt(
@@ -188,9 +260,13 @@ pub async fn connect_tcp_with_mark<A: tokio::net::ToSocketAddrs>(addr: A) -> any
         )
     };
     if ret != 0 {
-        log::warn!("Failed to set SO_MARK on outgoing TCP: {}", std::io::Error::last_os_error());
+        log::warn!(
+            "bind_udp_with_mark: failed to set SO_MARK on UDP socket: {}",
+            std::io::Error::last_os_error()
+        );
     }
-    Ok(stream)
+    std_socket.set_nonblocking(true)?;
+    Ok(UdpSocket::from_std(std_socket)?)
 }
 
 /// Set SO_MARK on a raw file descriptor to bypass TPROXY routing rules.

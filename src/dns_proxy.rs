@@ -309,8 +309,19 @@ impl DnsProxy {
             }
         }
 
+        // Strip EDNS0 CLIENT-SUBNET (ECS) option from the query before forwarding.
+        //
+        // Some stub resolvers and operating systems include an ECS option (RFC 7871,
+        // option code 8) in DNS queries to help authoritative servers return
+        // geographically optimal answers.  When the DNS proxy forwards the query to
+        // an upstream DoH/DoT resolver running on a remote SOCKS5 exit node, the ECS
+        // option would expose the original client's IP prefix to the authoritative
+        // server.  Stripping it prevents this privacy leak — the authoritative server
+        // will see the upstream resolver's IP (e.g., Google's) instead.
+        let query_to_forward = strip_ecs_option(&query_data);
+
         // Forward the query transparently to upstream via raw forwarding
-        let response = match self.resolver.resolve_raw(&query_data).await {
+        let response = match self.resolver.resolve_raw(query_to_forward.as_ref()).await {
             Ok(response_bytes) => {
                 if self.config.log_queries {
                     debug!(
@@ -519,6 +530,91 @@ impl DnsProxy {
         let expired = self.cache.iter().filter(|entry| entry.is_expired()).count();
         (total, expired)
     }
+}
+
+// ---------------------------------------------------------------------------
+// EDNS0 helpers
+// ---------------------------------------------------------------------------
+
+/// Strip the EDNS0 CLIENT-SUBNET option from a raw DNS query.
+///
+/// Walks the Additional section looking for an OPT pseudo-RR (type 41).
+/// If found, rewrites the RDATA to remove any option with code 8 (CLIENT-SUBNET)
+/// and returns a new wire-format buffer with the option removed.
+///
+/// If the query contains no OPT RR or no CLIENT-SUBNET option, returns a
+/// `Cow::Borrowed` of the original buffer — no allocation occurs.
+///
+/// The function is intentionally conservative: if any parse error occurs it
+/// returns the original buffer unchanged so that the caller can still forward it.
+fn strip_ecs_option(query: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    // DNS header is 12 bytes minimum.
+    if query.len() < 12 {
+        return std::borrow::Cow::Borrowed(query);
+    }
+
+    // Quick scan: look for an OPT RR in the additional section using a simple
+    // byte-level search to avoid a full DNS parse if there is no OPT RR.
+    // We search the buffer for tag byte 0x00 (root label) followed by
+    // type bytes 0x00 0x29 (41 = OPT).  This is a heuristic to quickly
+    // determine if the expensive path is needed.
+    let has_opt = query.windows(3).any(|w| w[0] == 0x00 && w[1] == 0x00 && w[2] == 0x29);
+    if !has_opt {
+        return std::borrow::Cow::Borrowed(query);
+    }
+
+    // Full parse to locate the OPT RR and strip the CLIENT-SUBNET option.
+    match strip_ecs_full(query) {
+        Some(stripped) => {
+            debug!("DNS: stripped EDNS0 CLIENT-SUBNET from query");
+            std::borrow::Cow::Owned(stripped)
+        }
+        None => std::borrow::Cow::Borrowed(query),
+    }
+}
+
+/// Parse a raw DNS message and return a new buffer with the EDNS0 CLIENT-SUBNET
+/// option removed.  Returns `None` if no CLIENT-SUBNET option is present or if
+/// parsing fails.
+fn strip_ecs_full(query: &[u8]) -> Option<Vec<u8>> {
+    use hickory_proto::op::Message;
+    use hickory_proto::rr::rdata::opt::EdnsCode;
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+
+    // Parse message
+    let mut msg = Message::from_bytes(query).ok()?;
+
+    let mut modified = false;
+
+    // Walk additionals looking for OPT RR
+    let additionals: Vec<_> = msg.additionals().to_vec();
+    msg.take_additionals();
+
+    for mut record in additionals {
+        if let Some(hickory_proto::rr::RData::OPT(opt)) = record.data().cloned() {
+            // Check if this OPT RR contains a CLIENT-SUBNET option
+            if opt.as_ref().contains_key(&EdnsCode::Subnet) {
+                // Rebuild OPT without the Subnet (CLIENT-SUBNET) option
+                let mut new_opt = hickory_proto::rr::rdata::OPT::default();
+                for (code, option) in opt.as_ref().iter() {
+                    if *code != EdnsCode::Subnet {
+                        new_opt.insert(option.clone());
+                    }
+                }
+                record.set_data(Some(hickory_proto::rr::RData::OPT(new_opt)));
+                modified = true;
+            }
+            msg.add_additional(record);
+        } else {
+            msg.add_additional(record);
+        }
+    }
+
+    if !modified {
+        return None;
+    }
+
+    msg.to_bytes().ok().map(|b| b.to_vec())
 }
 
 // ---------------------------------------------------------------------------

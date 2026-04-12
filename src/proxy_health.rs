@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use crate::transparent::connect_tcp_with_mark;
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 
@@ -829,7 +829,7 @@ impl ProxyHealthTracker {
     /// This validates the SOCKS5 server is alive and responding, not just TCP-reachable.
     async fn probe_socks5(&self, addr: &str) -> Result<(), String> {
         // Step 1: TCP connect with timeout
-        let stream = match timeout(self.config.probe_timeout, TcpStream::connect(addr)).await {
+        let stream = match timeout(self.config.probe_timeout, connect_tcp_with_mark(addr)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(format!("TCP connect to {}: {}", addr, e)),
             Err(_) => return Err(format!("TCP connect timeout ({}s) to {}", self.config.probe_timeout.as_secs(), addr)),

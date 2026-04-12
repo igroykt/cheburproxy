@@ -363,23 +363,13 @@ struct ProcessedRule {
 /// Optimized domain pattern for fast matching
 #[derive(Clone, Debug)]
 enum DomainPattern {
-    /// Suffix match (e.g., ".example.com")
-    //Suffix(String),
+    /// Matches the domain itself and all its subdomains (default behavior).
+    /// e.g., "google.com" matches "google.com" and "docs.google.com".
     DomainAndSubs(String),
+    /// Matches only the exact domain, not any subdomains.
+    /// Created by the `^` prefix in router.json, e.g. `"^google.com"`.
+    Exact(String),
 }
-
-/*impl DomainPattern {
-    /// Check if the pattern matches the given domain
-    fn matches(&self, domain: &str) -> bool {
-        match self {
-            DomainPattern::Exact(pattern) => pattern.eq_ignore_ascii_case(domain),
-            DomainPattern::Suffix(pattern) => {
-                domain.len() >= pattern.len() &&
-                domain[domain.len() - pattern.len()..].eq_ignore_ascii_case(pattern)
-            }
-        }
-    }
-}*/
 
 impl DomainPattern {
     fn normalize(s: &str) -> String {
@@ -422,20 +412,20 @@ impl DomainPattern {
     fn matches_normalized(&self, domain: &str) -> bool {
         match self {
             DomainPattern::DomainAndSubs(p) => Self::ends_with_domain_boundary(domain, p),
+            DomainPattern::Exact(p) => domain.eq_ignore_ascii_case(p),
         }
     }
 }
 
 impl From<&str> for DomainPattern {
-    /// Пример парсинга правил:
-    /// - ".apple.com" можно трактовать как ровно поддомены (исключая сам apple.com), если нужно
-    /// - "apple.com" → DomainAndSubs("apple.com")
+    /// Парсинг правил домена:
+    /// - `"^google.com"` → `Exact("google.com")` — матчит только сам домен, без поддоменов
+    /// - `"google.com"`  → `DomainAndSubs("google.com")` — матчит домен и все поддомены (поведение по умолчанию)
     fn from(s: &str) -> Self {
         let s = DomainPattern::normalize(s);
-        // Если хотите особую семантику для лидирующей точки — раскомментируйте и расширьте.
-        // if s.starts_with('.') {
-        //     return DomainPattern::SubdomainsOnly(s.trim_start_matches('.').to_string());
-        // }
+        if let Some(stripped) = s.strip_prefix('^') {
+            return DomainPattern::Exact(stripped.to_string());
+        }
         DomainPattern::DomainAndSubs(s)
     }
 }
@@ -642,20 +632,23 @@ impl RuleEngine {
         })
     }
 
-    /// Parse a domain pattern into optimized format
+    /// Parse a domain pattern into optimized format.
+    ///
+    /// Supports the `^` prefix for exact-only matching:
+    /// - `"^google.com"` → `Exact` — matches only `google.com`, not `docs.google.com`
+    /// - `"google.com"`  → `DomainAndSubs` — matches `google.com` and all subdomains
     fn parse_domain_pattern(domain: &str) -> anyhow::Result<DomainPattern> {
         if domain.is_empty() {
             return Err(anyhow!(RuleEngineError::InvalidDomain(
                 "Empty domain pattern".to_string()
             )));
         }
-
-        /*if domain.starts_with('.') {
-            Ok(DomainPattern::Suffix(domain.to_lowercase()))
+        let lower = domain.to_lowercase();
+        if let Some(stripped) = lower.strip_prefix('^') {
+            Ok(DomainPattern::Exact(stripped.to_string()))
         } else {
-            Ok(DomainPattern::Exact(domain.to_lowercase()))
-        }*/
-        Ok(DomainPattern::DomainAndSubs(domain.to_lowercase()))
+            Ok(DomainPattern::DomainAndSubs(lower))
+        }
     }
 
     /// Merge geosite categories from JSON config and domain patterns
@@ -904,7 +897,9 @@ impl RuleEngine {
             .flat_map(|rule| {
                 rule.domain_patterns.iter().filter_map(|pattern| {
                     match pattern {
-                        DomainPattern::DomainAndSubs(domain) => Some(get_top_level_domain(domain)),
+                        DomainPattern::DomainAndSubs(domain) | DomainPattern::Exact(domain) => {
+                            Some(get_top_level_domain(domain))
+                        }
                     }
                 })
             })
@@ -932,7 +927,7 @@ impl RuleEngine {
         for rule in self.rules.iter() {
             for pattern in &rule.domain_patterns {
                 let domain = match pattern {
-                    DomainPattern::DomainAndSubs(d) => d.clone(),
+                    DomainPattern::DomainAndSubs(d) | DomainPattern::Exact(d) => d.clone(),
                 };
                 domain_count += 1;
 

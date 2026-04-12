@@ -7,7 +7,7 @@ use super::{DnsError, DnsProtocolHandler, DnsResult};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use hickory_proto::{
-    op::{Message, MessageType, OpCode, Query},
+    op::{Edns, Message, MessageType, OpCode, Query},
     rr::{Name, RecordType},
     serialize::binary::{BinDecodable, BinEncodable},
 };
@@ -206,7 +206,14 @@ impl DohHandler {
         message.set_message_type(MessageType::Query);
         message.set_op_code(OpCode::Query);
         message.set_recursion_desired(true);
-        
+
+        // Set EDNS0 OPT record with DO (DNSSEC OK) bit so the upstream resolver
+        // validates and returns DNSSEC signatures (RRSIG, DNSKEY, etc.).
+        let mut edns = Edns::new();
+        edns.set_max_payload(4096);
+        edns.set_dnssec_ok(true);
+        message.set_edns(edns);
+
         let query = Query::query(name, record_type);
         message.add_query(query);
         
